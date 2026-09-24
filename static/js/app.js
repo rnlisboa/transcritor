@@ -136,6 +136,7 @@
       uploadedBytes: 0,
       error: null,
       thumbnailUrl: null,
+      audioUrl: null,
       previewUrl: null,
       transcription: "",
       xhr: null,
@@ -162,6 +163,7 @@
     item.error = video.error;
     item.transcription = video.transcription || "";
     if (video.thumbnail_url) item.thumbnailUrl = video.thumbnail_url;
+    item.audioUrl = video.audio_url || null;
     item.file = null; // já está no servidor; libera a referência ao arquivo local
   }
 
@@ -549,6 +551,7 @@
       transcriptText: q(".transcript__text"),
       copyButton: q(".btn--copy"),
       copyLabel: q(".btn--copy__label"),
+      downloadLink: q(".btn--download"),
     };
     refs.thumbImg.addEventListener("error", () => {
       refs.thumbImg.dataset.failed = "1";
@@ -665,6 +668,12 @@
       }
       el.transcriptText.classList.toggle("is-empty", empty);
       el.copyButton.hidden = !completed || empty;
+    }
+
+    // Áudio para baixar (ex.: para transcrever em outro serviço), assim que foi extraído.
+    el.downloadLink.hidden = !item.audioUrl;
+    if (item.audioUrl && el.downloadLink.getAttribute("href") !== item.audioUrl) {
+      el.downloadLink.href = item.audioUrl;
     }
   }
 

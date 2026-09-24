@@ -28,9 +28,11 @@ def mp4_upload(name="aula.mp4", content=MP4_BYTES, content_type="video/mp4"):
     return SimpleUploadedFile(name, content, content_type=content_type)
 
 
-def fake_extract_audio(video_path, audio_path):
+def fake_extract_audio(video_path, audio_path, download_path=None):
     Path(audio_path).parent.mkdir(parents=True, exist_ok=True)
     Path(audio_path).write_bytes(b"RIFF" + b"\x00" * 100)
+    if download_path is not None:
+        Path(download_path).write_bytes(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 50)
     return audio_path
 
 
@@ -55,8 +57,9 @@ class BaseTestCase(TestCase):
     def create_transcribing_video(self, **kwargs):
         video = self.create_video(status=Video.Status.TRANSCRIBING, **kwargs)
         audio_name = processor.audio_name_for(video)
-        fake_extract_audio(None, Path(TEMP_MEDIA) / audio_name)
-        Video.objects.filter(pk=video.pk).update(audio_file=audio_name, video_file="")
+        download_name = processor.download_audio_name_for(video)
+        fake_extract_audio(None, Path(TEMP_MEDIA) / audio_name, Path(TEMP_MEDIA) / download_name)
+        Video.objects.filter(pk=video.pk).update(audio_file=audio_name, download_audio=download_name, video_file="")
         video.refresh_from_db()
         return video
 
@@ -157,6 +160,20 @@ class ExtractStepTests(BaseTestCase):
         self.assertEqual(video.video_file.name, "")
         self.assertFalse(video_path.exists())  # o vídeo é apagado para economizar disco
         self.assertTrue(Path(video.audio_file.path).is_file())
+        self.assertTrue(Path(video.download_audio.path).is_file())
+        self.assertEqual(response.json()["video"]["audio_url"], reverse("transcritor:audio", args=[video.pk]))
+
+    def test_extract_error_removes_download_audio(self, extract):
+        def fail_after_writing(video_path, audio_path, download_path=None):
+            fake_extract_audio(video_path, audio_path, download_path)
+            raise ProcessingError("O arquivo está corrompido ou não é um vídeo válido.")
+
+        extract.side_effect = fail_after_writing
+        video = self.create_video()
+        data = self.post_step("extract", video).json()["video"]
+        self.assertEqual(data["status"], "ERROR")
+        self.assertIsNone(data["audio_url"])
+        self.assertFalse((Path(TEMP_MEDIA) / processor.download_audio_name_for(video)).exists())
 
     def test_ffmpeg_error_marks_video_as_error_with_friendly_message(self, extract):
         extract.side_effect = ProcessingError("O vídeo não possui trilha de áudio para transcrever.")
@@ -201,6 +218,8 @@ class TranscribeStepTests(BaseTestCase):
         self.assertEqual((second["status"], second["progress"]), ("COMPLETED", 100))
         self.assertEqual(second["transcription"], "Olá gabi tudo bem")
         self.assertFalse(any((Path(TEMP_MEDIA) / "audio").glob(f"{video.pk}.wav")))  # áudio removido
+        self.assertTrue(Path(video.download_audio.path).is_file())  # o áudio para baixar fica
+        self.assertIsNotNone(second["audio_url"])
 
     def test_transcription_error_marks_error(self):
         video = self.create_transcribing_video()
@@ -211,6 +230,7 @@ class TranscribeStepTests(BaseTestCase):
             data = self.post_step("transcribe", video).json()["video"]
         self.assertEqual(data["status"], "ERROR")
         self.assertIn("modelo", data["error"])
+        self.assertIsNotNone(data["audio_url"])  # dá para baixar o áudio e transcrever em outro lugar
 
     def test_missing_audio_marks_error(self):
         video = self.create_transcribing_video()
@@ -233,6 +253,24 @@ class TranscribeStepTests(BaseTestCase):
         self.assertEqual(self.post_step("transcribe", self.create_video()).status_code, 409)
 
 
+class AudioDownloadTests(BaseTestCase):
+    def test_download_returns_attachment_named_after_video(self):
+        video = self.create_transcribing_video(name="Aula 1.mp4")
+        response = self.client.get(reverse("transcritor:audio", args=[video.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "audio/mp4")
+        self.assertIn('attachment; filename="Aula 1.m4a"', response["Content-Disposition"])
+        self.assertTrue(b"".join(response.streaming_content).startswith(b"\x00\x00\x00\x18ftyp"))
+
+    def test_download_without_audio_returns_404(self):
+        video = self.create_video()
+        self.assertEqual(self.client.get(reverse("transcritor:audio", args=[video.pk])).status_code, 404)
+
+    def test_cannot_download_other_owner_audio(self):
+        video = self.create_transcribing_video(owner_key="outra-pessoa")
+        self.assertEqual(self.client.get(reverse("transcritor:audio", args=[video.pk])).status_code, 404)
+
+
 class ClearTests(BaseTestCase):
     def test_clear_removes_records_and_files_of_owner_only(self):
         mine = self.create_video()
@@ -242,6 +280,7 @@ class ClearTests(BaseTestCase):
         Video.objects.filter(pk=mine.pk).update(thumbnail="thumbnails/t.jpg")
         transcribing = self.create_transcribing_video()
         audio = Path(transcribing.audio_file.path)
+        download = Path(transcribing.download_audio.path)
         other = self.create_video(owner_key="outra-pessoa")
 
         response = self.client.post(reverse("transcritor:clear"))
@@ -251,6 +290,7 @@ class ClearTests(BaseTestCase):
         self.assertFalse(Path(mine.video_file.path).exists())
         self.assertFalse(thumb.exists())
         self.assertFalse(audio.exists())
+        self.assertFalse(download.exists())
         self.assertTrue(Video.objects.filter(pk=other.pk).exists())
         self.assertTrue(Path(other.video_file.path).exists())
 
@@ -304,8 +344,9 @@ class FFmpegIntegrationTests(TestCase):
             video = Path(tmp) / "teste.mp4"
             make_test_video(video)
             self.assertTrue(ffmpeg.generate_thumbnail(video, Path(tmp) / "thumb.jpg"))
-            audio = ffmpeg.extract_audio(video, Path(tmp) / "audio.wav")
+            audio = ffmpeg.extract_audio(video, Path(tmp) / "audio.wav", Path(tmp) / "audio.m4a")
             self.assertGreater(audio.stat().st_size, 44)
+            self.assertGreater((Path(tmp) / "audio.m4a").stat().st_size, 0)
 
     def test_video_without_audio_has_friendly_error(self):
         with tempfile.TemporaryDirectory() as tmp:

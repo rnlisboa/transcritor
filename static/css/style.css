@@ -393,6 +393,19 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .btn--copy.is-copied .copy-icon { display: none; }
 .btn--copy.is-copied .check-icon { display: block; }
 
+.btn--download {
+  align-self: stretch;
+  min-height: 42px;
+  font-size: 14px;
+  color: var(--secondary-ink);
+  background: var(--secondary-soft);
+  border-color: #e8e4c8;
+  text-decoration: none;
+}
+.btn--download:hover { background: #eeebd6; }
+.btn--download svg { width: 18px; height: 18px; }
+.btn--download[hidden] { display: none; }
+
 /* Toasts ------------------------------------------------------------------------------ */
 
 .toasts {

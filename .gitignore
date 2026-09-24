@@ -27,6 +27,9 @@ staticfiles/
 # Modelos de transcrição (baixados à parte)
 models/
 
+# Pacote gerado para o deploy
+dist/
+
 # Logs e IDEs
 *.log
 .vscode/

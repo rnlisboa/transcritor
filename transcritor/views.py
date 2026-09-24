@@ -53,6 +53,7 @@ def _serialize(video):
         "error": video.error_message or None,
         "transcription": video.transcription,
         "thumbnail_url": reverse("transcritor:thumbnail", args=[video.pk]) if video.thumbnail else None,
+        "audio_url": reverse("transcritor:audio", args=[video.pk]) if video.download_audio else None,
     }
 
 
@@ -185,3 +186,18 @@ def video_thumbnail(request, video_id):
         raise Http404
     response["Cache-Control"] = "private, max-age=86400"
     return response
+
+
+@require_GET
+def video_audio(request, video_id):
+    """Baixa o áudio do vídeo (M4A), com o nome do vídeo original."""
+    video = _own_video(request, video_id)
+    if not video.download_audio:
+        raise Http404
+    filename = f"{Path(video.original_name).stem or 'audio'}.m4a"
+    try:
+        return FileResponse(
+            video.download_audio.open("rb"), as_attachment=True, filename=filename, content_type="audio/mp4"
+        )
+    except (OSError, ValueError):
+        raise Http404

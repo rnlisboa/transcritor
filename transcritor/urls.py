@@ -11,4 +11,5 @@ urlpatterns = [
     path("api/videos/<int:video_id>/extract/", views.extract_audio, name="extract"),
     path("api/videos/<int:video_id>/transcribe/", views.transcribe_chunk, name="transcribe"),
     path("api/videos/<int:video_id>/thumbnail/", views.video_thumbnail, name="thumbnail"),
+    path("api/videos/<int:video_id>/audio/", views.video_audio, name="audio"),
 ]

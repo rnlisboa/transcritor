@@ -6,6 +6,8 @@ Aplicação Django de página única que transforma vídeos em texto:
 2. a página envia e processa **um vídeo de cada vez**: extrai o áudio com **FFmpeg** e transcreve com **Vosk**;
 3. o texto aparece no card do vídeo enquanto é gerado, e no final surge um botão para copiar.
 
+Cada card também tem um botão **Baixar áudio do vídeo** (arquivo `.m4a`), útil se a transcrição não ficou boa e você quiser usar outro serviço.
+
 Stack: Python 3.10+, Django 5.2, SQLite, templates Django, HTML/CSS/JavaScript puro.
 Dependências Python: apenas `Django` e `vosk`. O projeto não precisa de worker, fila, Celery, Redis, Docker nem GPU, e cabe no **plano gratuito do PythonAnywhere**.
 
@@ -28,7 +30,8 @@ Para cada vídeo, em ordem:
 - **Requisições curtas:** cada pedaço leva ~10 s e para numa pausa da fala, para não cortar palavras. O PythonAnywhere encerra requisições com mais de 5 minutos, e aqui nenhuma chega perto disso.
 - **Progresso real:** o percentual indica quanto do áudio já foi transcrito. Durante a extração do áudio não há métrica confiável, então aparece só um indicador animado.
 - **Retomável:** o avanço fica salvo no banco. Se a página for fechada, o vídeo aparece como **Pausado**; é só clicar em **Transcrever vídeos** para continuar de onde parou.
-- **Pouco disco:** o vídeo é apagado logo após a extração do áudio. O áudio temporário (~1,9 MB por minuto) é apagado ao terminar. Ficam só a miniatura e o texto.
+- **Pouco disco:** o vídeo é apagado logo após a extração do áudio. O áudio temporário para o Vosk (WAV, ~1,9 MB por minuto) é apagado ao terminar. Ficam a miniatura, o texto e uma cópia compacta do áudio para download (M4A mono 64 kbps, ~0,5 MB por minuto), gerada na mesma chamada do FFmpeg.
+- **Áudio para download:** fica disponível assim que o áudio é extraído, inclusive se a transcrição falhar depois. Ele só é apagado ao clicar em **Limpar vídeos**, então limpe de vez em quando para não ocupar a cota de disco.
 - **Por que não há worker:** no plano gratuito do PythonAnywhere não existem Always-on Tasks nem tarefas agendadas, e processos em console têm cota de 100 s de CPU por dia. Requisições web não entram nessa cota.
 - **Sessão:** não há login. Cada navegador vê e limpa apenas os próprios vídeos, identificados por um cookie de sessão.
 
@@ -125,7 +128,7 @@ Elas podem ser definidas no ambiente do sistema ou no arquivo `.env` na raiz do 
 | `FFMPEG_BINARY` | `ffmpeg` | Nome ou caminho do executável do FFmpeg. |
 | `SECURE_COOKIES` | `True` se `DEBUG=False` | Envia os cookies apenas por HTTPS. |
 | `LOG_LEVEL` | `INFO` | Nível de log da aplicação. |
-| `MEDIA_ROOT` | `<projeto>/media` | Pasta onde vídeos, áudios temporários e miniaturas são salvos. |
+| `MEDIA_ROOT` | `<projeto>/media` | Pasta onde vídeos, áudios (temporários e para download) e miniaturas são salvos. |
 
 Para gerar uma `SECRET_KEY`:
 
@@ -140,6 +143,22 @@ python -c "import secrets; print(secrets.token_urlsafe(50))"
 Nos exemplos, troque `USUARIO` pelo seu nome de usuário.
 
 **Uso de disco:** ~100 MB de dependências + 51 MB do modelo. Sobram cerca de 350 MB dos 512 MB do plano gratuito, usados só temporariamente pelo vídeo que está sendo processado.
+
+### Caminho rápido (pacote .zip + script)
+
+1. No seu computador, gere o pacote com `python deploy/make_zip.py`. Ele cria `dist/transcritor.zip` já com o modelo Vosk (baixe-o antes com `python manage.py download_vosk_model`).
+2. **Files:** envie `transcritor.zip` para `/home/USUARIO/`.
+3. **Web → Add a new web app → Manual configuration →** escolha o Python (ex.: 3.12).
+4. **Bash console:**
+   ```bash
+   unzip -o ~/transcritor.zip -d ~ && bash ~/transcritor/deploy/pythonanywhere.sh 3.12
+   ```
+   O script cria o ambiente virtual, instala as dependências, gera o `.env` com uma `SECRET_KEY` nova, prepara o banco e os estáticos e escreve o arquivo WSGI.
+5. **Web:** preencha o *Virtualenv* e o *Static files* que o script mostrar no final, ative *Force HTTPS* e clique em **Reload**.
+
+Para atualizar depois, envie o novo `.zip` e repita o passo 4. O `.env` e o banco são mantidos.
+
+Os passos abaixo descrevem a mesma instalação feita manualmente.
 
 ### 1. Conta e código
 
@@ -211,7 +230,7 @@ Na página do Web App:
 - **Source code:** `/home/USUARIO/transcritor`
 - **Force HTTPS:** ativado
 - **Static files:** URL `/static/` → Directory `/home/USUARIO/transcritor/staticfiles`
-  (**não** mapeie `/media/`: os vídeos não devem ser públicos, e as miniaturas passam por uma view que confere o dono)
+  (**não** mapeie `/media/`: os arquivos não devem ser públicos, e miniaturas e áudios passam por views que conferem o dono)
 
 ### 7. Arquivo WSGI
 
@@ -272,11 +291,11 @@ Para ver mais detalhes, defina `LOG_LEVEL=DEBUG` no `.env` e clique em **Reload*
 ├── config/                      # settings, urls, wsgi
 ├── transcritor/
 │   ├── models.py                # Video (status, arquivos, posição no áudio, transcrição)
-│   ├── views.py                 # página + API JSON (upload, extrair, transcrever, limpar, miniatura)
+│   ├── views.py                 # página + API JSON (upload, extrair, transcrever, limpar, miniatura, áudio)
 │   ├── forms.py                 # validação do upload (extensão, tamanho, MIME, assinatura do arquivo)
 │   ├── middleware.py            # recusa uploads grandes antes de ler o corpo
 │   ├── services/
-│   │   ├── ffmpeg.py            # extração de áudio e miniatura (subprocess, sem shell)
+│   │   ├── ffmpeg.py            # extração de áudio (WAV + M4A) e miniatura (subprocess, sem shell)
 │   │   ├── transcription.py     # Vosk: modelo carregado uma vez, transcrição em pedaços
 │   │   └── processor.py         # etapas do processamento e limpeza
 │   ├── management/commands/download_vosk_model.py
@@ -284,7 +303,7 @@ Para ver mais detalhes, defina `LOG_LEVEL=DEBUG` no `.env` e clique em **Reload*
 ├── templates/                   # index.html, 404.html, 500.html
 ├── static/                      # css/style.css, js/app.js, img/
 ├── models/                      # modelo Vosk (não versionado)
-└── media/                       # videos/, audio/ (temporários), thumbnails/
+└── media/                       # videos/, audio/ (WAV temporário + M4A para download), thumbnails/
 ```
 
 ## Segurança

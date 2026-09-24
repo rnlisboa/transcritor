@@ -43,6 +43,10 @@ def audio_name_for(video):
     return f"audio/{video.pk}.wav"
 
 
+def download_audio_name_for(video):
+    return f"audio/{video.pk}.m4a"
+
+
 def _friendly_message(exc):
     if isinstance(exc, ProcessingError):
         return exc.user_message
@@ -51,18 +55,27 @@ def _friendly_message(exc):
     return GENERIC_ERROR_MESSAGE
 
 
-def _fail(video, exc):
-    """Marca o vídeo como ERROR e apaga vídeo e áudio (não há como reprocessar)."""
+def _fail(video, exc, keep_download_audio=True):
+    """Marca o vídeo como ERROR e apaga vídeo e áudio (não há como reprocessar).
+
+    O áudio para download é mantido quando já existe: a pessoa ainda pode
+    transcrevê-lo em outro lugar.
+    """
     message = _friendly_message(exc)
     if isinstance(exc, ProcessingError):
         logger.warning("Vídeo #%s: %s", video.pk, message)
     else:
         logger.error("Vídeo #%s: erro inesperado.", video.pk, exc_info=exc)
-    Video.objects.filter(pk=video.pk).update(
+    fields = dict(
         status=Video.Status.ERROR, error_message=message[:500], progress=None,
         video_file="", audio_file="", updated_at=timezone.now(),
     )
-    delete_stored_files([video.video_file.name, video.audio_file.name, audio_name_for(video)])
+    file_names = [video.video_file.name, video.audio_file.name, audio_name_for(video)]
+    if not keep_download_audio:
+        fields["download_audio"] = ""
+        file_names += [video.download_audio.name, download_audio_name_for(video)]
+    Video.objects.filter(pk=video.pk).update(**fields)
+    delete_stored_files(file_names)
 
 
 def extract_audio(video):
@@ -77,21 +90,27 @@ def extract_audio(video):
         raise InvalidStateError()
 
     audio_name = audio_name_for(video)
+    download_name = download_audio_name_for(video)
+    download_path = Path(settings.MEDIA_ROOT) / download_name
     try:
         if not video.video_file:
             raise ProcessingError("O arquivo do vídeo não foi encontrado. Envie o vídeo novamente.")
         Video.objects.filter(pk=video.pk).update(audio_file=audio_name)
-        ffmpeg.extract_audio(Path(video.video_file.path), Path(settings.MEDIA_ROOT) / audio_name)
+        ffmpeg.extract_audio(Path(video.video_file.path), Path(settings.MEDIA_ROOT) / audio_name, download_path)
     except Exception as exc:
-        _fail(video, exc)
+        _fail(video, exc, keep_download_audio=False)
         return
 
-    Video.objects.filter(pk=video.pk).update(
+    has_download = download_path.is_file() and download_path.stat().st_size > 0
+    updated = Video.objects.filter(pk=video.pk).update(
         status=Video.Status.TRANSCRIBING, progress=0, audio_position=0, transcription="",
-        video_file="", updated_at=timezone.now(),
+        video_file="", download_audio=download_name if has_download else "", updated_at=timezone.now(),
     )
-    delete_stored_files([video.video_file.name])
-    logger.info("Vídeo #%s: áudio extraído; vídeo original removido.", video.pk)
+    if updated:
+        delete_stored_files([video.video_file.name] + ([] if has_download else [download_name]))
+        logger.info("Vídeo #%s: áudio extraído; vídeo original removido.", video.pk)
+    else:  # removido durante a etapa
+        delete_stored_files([video.video_file.name, audio_name, download_name])
 
 
 def transcribe_next_chunk(video):
@@ -137,7 +156,7 @@ def clear_videos(owner_key):
     file_names = []
     for video in videos:
         file_names.extend(video.stored_file_names())
-        file_names.append(audio_name_for(video))
+        file_names += [audio_name_for(video), download_audio_name_for(video)]
     Video.objects.filter(pk__in=[v.pk for v in videos]).delete()
     delete_stored_files(file_names)
     logger.info("Limpeza concluída: %s vídeo(s) removido(s).", len(videos))

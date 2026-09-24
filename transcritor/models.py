@@ -24,6 +24,8 @@ class Video(models.Model):
     # O vídeo é apagado assim que o áudio é extraído (economiza disco).
     video_file = models.FileField(upload_to=video_upload_to, blank=True, max_length=255)
     audio_file = models.FileField(blank=True, max_length=255)
+    # Cópia compacta do áudio (M4A) que a pessoa pode baixar; fica até a limpeza.
+    download_audio = models.FileField(blank=True, max_length=255)
     thumbnail = models.FileField(blank=True, max_length=255)
     transcription = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True)
@@ -45,4 +47,4 @@ class Video(models.Model):
 
     def stored_file_names(self):
         """Nomes (relativos ao MEDIA_ROOT) de todos os arquivos ligados ao vídeo."""
-        return [f.name for f in (self.video_file, self.audio_file, self.thumbnail) if f and f.name]
+        return [f.name for f in (self.video_file, self.audio_file, self.download_audio, self.thumbnail) if f and f.name]

@@ -70,15 +70,31 @@ def _run(args, timeout, failure_message):
         raise FFmpegError(_friendly_message(stderr, failure_message)) from exc
 
 
-def extract_audio(video_path, audio_path):
+def extract_audio(video_path, audio_path, download_path=None):
     """Extrai a primeira trilha de áudio como WAV mono 16 kHz, o formato que o Vosk espera.
 
     Mono/16 kHz ocupa ~1,9 MB por minuto, sem perda relevante para transcrição.
+    Com download_path, gera na mesma chamada (o vídeo é lido uma vez só) uma cópia
+    M4A/AAC mono a 64 kbps (~0,5 MB por minuto) para a pessoa baixar.
     """
     video_path, audio_path = Path(video_path), Path(audio_path)
     if not video_path.is_file():
         raise ProcessingError("O arquivo do vídeo não foi encontrado.")
     audio_path.parent.mkdir(parents=True, exist_ok=True)
+
+    download_args = []
+    if download_path is not None:
+        download_path = Path(download_path)
+        download_path.parent.mkdir(parents=True, exist_ok=True)
+        download_args = [
+            "-map", "0:a:0",
+            "-vn", "-sn", "-dn",
+            "-ac", "1",
+            "-c:a", "aac",
+            "-b:a", "64k",
+            "-movflags", "+faststart",
+            str(download_path),
+        ]
 
     _run(
         [
@@ -89,6 +105,7 @@ def extract_audio(video_path, audio_path):
             "-ar", "16000",
             "-c:a", "pcm_s16le",
             str(audio_path),
+            *download_args,
         ],
         timeout=EXTRACTION_TIMEOUT_SECONDS,
         failure_message="Não foi possível extrair o áudio do vídeo.",
