@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+
+# Configuração local (nunca versionar secrets)
+.env
+
+# Banco de dados local
+db.sqlite3
+db.sqlite3-journal
+
+# Arquivos enviados/gerados
+media/videos/*
+media/thumbnails/*
+media/audio/*
+!media/**/.gitkeep
+
+# Estáticos coletados (collectstatic)
+staticfiles/
+
+# Arquivos de controle do worker
+var/
+
+# Logs e IDEs
+*.log
+.vscode/
+.idea/

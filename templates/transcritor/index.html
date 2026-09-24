@@ -1,0 +1,115 @@
+{% load static %}<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Transcritor da Gabi</title>
+  <link rel="icon" href="{% static 'img/favicon.svg' %}" type="image/svg+xml">
+  <link rel="stylesheet" href="{% static 'css/style.css' %}">
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div class="hero__mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg>
+      </div>
+      <h1 class="hero__title">Transcritor da Gabi</h1>
+      <p class="hero__subtitle">Transforme seus vídeos em texto de forma simples.</p>
+
+      <div class="actions">
+        <button type="button" class="btn btn--outline" id="pick-button">
+          <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+          <span>Escolher vídeos para transcrição</span>
+        </button>
+        <button type="button" class="btn btn--primary" id="transcribe-button" disabled>
+          <svg class="btn__icon" id="transcribe-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h2m3-5v10m4-13v16m4-11v6"/></svg>
+          <span class="btn__spinner" aria-hidden="true"></span>
+          <span id="transcribe-label">Transcrever vídeos</span>
+        </button>
+        <button type="button" class="btn btn--ghost-danger" id="clear-button" disabled>
+          <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>
+          <span>Limpar vídeos</span>
+        </button>
+      </div>
+      <p class="hint">Formatos aceitos: {{ formats_label }} · até {{ max_upload_size_mb }} MB por vídeo</p>
+      <input type="file" id="file-input" accept="{{ accept }},video/*" multiple hidden>
+    </header>
+
+    <section class="summary" id="summary" role="status" aria-live="polite" hidden>
+      <span class="summary__icon" id="summary-icon" aria-hidden="true"></span>
+      <div>
+        <p class="summary__title" id="summary-title"></p>
+        <p class="summary__detail" id="summary-detail"></p>
+      </div>
+    </section>
+
+    <section class="alert" id="worker-alert" role="alert" hidden>
+      <strong>O processador de vídeos não está ativo no momento.</strong>
+      Seus vídeos continuam na fila e serão transcritos automaticamente assim que ele for iniciado.
+    </section>
+
+    <section class="empty" id="empty-state">
+      <div class="empty__art" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9.5 4.5 2.5-4.5 2.5z"/></svg>
+      </div>
+      <p class="empty__title">Nenhum vídeo selecionado.</p>
+      <p class="empty__text">Clique em “Escolher vídeos para transcrição” para começar.</p>
+    </section>
+
+    <section class="grid" id="video-grid" aria-label="Vídeos"></section>
+  </main>
+
+  <footer class="credits">
+    Feito com <span role="img" aria-label="café">☕</span> por
+    <a href="https://www.linkedin.com/in/renannlisboa/" target="_blank" rel="noopener noreferrer">Renan Lisboa</a>
+  </footer>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <dialog class="dialog" id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 class="dialog__title" id="confirm-title">Limpar vídeos?</h2>
+      <p class="dialog__text">Tem certeza que deseja remover todos os vídeos e transcrições? Esta ação não pode ser desfeita.</p>
+      <div class="dialog__actions">
+        <button class="btn btn--outline" value="cancel">Cancelar</button>
+        <button class="btn btn--danger" value="confirm">Remover tudo</button>
+      </div>
+    </form>
+  </dialog>
+
+  <template id="card-template">
+    <article class="card">
+      <div class="card__thumb">
+        <img alt="" loading="lazy" hidden>
+        <div class="card__placeholder">
+          <img src="{% static 'img/placeholder.svg' %}" alt="">
+        </div>
+        <span class="card__index"></span>
+      </div>
+      <div class="card__body">
+        <h3 class="card__name"></h3>
+        <div class="status">
+          <span class="status__icon" aria-hidden="true"></span>
+          <span class="status__label"></span>
+          <span class="status__percent"></span>
+        </div>
+        <p class="card__detail"></p>
+        <div class="progress" hidden><div class="progress__fill"></div></div>
+        <p class="card__error" hidden></p>
+        <div class="transcript" hidden>
+          <div class="transcript__text" tabindex="0"></div>
+          <button type="button" class="btn btn--copy">
+            <svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg>
+            <svg class="check-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>
+            <span class="btn--copy__label">Copiar texto transcrito</span>
+          </button>
+        </div>
+      </div>
+    </article>
+  </template>
+
+  {{ app_config|json_script:"app-config" }}
+  <script src="{% static 'js/app.js' %}"></script>
+</body>
+</html>
