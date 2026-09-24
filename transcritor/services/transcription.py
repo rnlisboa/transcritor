@@ -1,86 +1,128 @@
-"""Transcrição de áudio com Faster-Whisper.
+"""Transcrição de áudio com Vosk, em pedaços curtos.
 
-O modelo é carregado uma única vez por instância de TranscriptionService e
-reutilizado para todos os vídeos processados pelo worker.
+Cada chamada de `transcribe_chunk` processa o áudio a partir de uma posição
+até passar ~TRANSCRIBE_CHUNK_SECONDS de processamento e parar na próxima pausa
+da fala. Assim cada requisição HTTP é curta e a transcrição pode ser retomada
+de onde parou. O modelo é carregado uma vez por processo e reaproveitado.
 """
+import json
 import logging
+import threading
 import time
+import wave
+from dataclasses import dataclass
+from pathlib import Path
 
 from django.conf import settings
 
-from .errors import ProcessingAborted, ProcessingError
+from .errors import ProcessingError
 
 logger = logging.getLogger(__name__)
 
+BLOCK_SECONDS = 0.25
+# Se a fala não fizer pausa, corta mesmo assim após o dobro do tempo previsto.
+HARD_LIMIT_FACTOR = 2
+
+_model = None
+_model_lock = threading.Lock()
+
 
 class ModelUnavailableError(ProcessingError):
-    default_message = (
-        "Não foi possível carregar o modelo de transcrição. "
-        "Verifique a configuração WHISPER_MODEL e o acesso ao download do modelo."
-    )
+    default_message = "O modelo de transcrição não está disponível no servidor. Avise o administrador."
 
 
 class TranscriptionError(ProcessingError):
     default_message = "Não foi possível transcrever o áudio do vídeo."
 
 
-class TranscriptionService:
-    def __init__(self, model_name=None, device=None, compute_type=None, language=None):
-        self.model_name = model_name or settings.WHISPER_MODEL
-        self.device = device or settings.WHISPER_DEVICE
-        self.compute_type = compute_type or settings.WHISPER_COMPUTE_TYPE
-        language = language if language is not None else settings.WHISPER_LANGUAGE
-        # "auto" (ou vazio) deixa o Whisper detectar o idioma.
-        self.language = None if language.lower() in {"", "auto"} else language
-        self._model = None
+@dataclass
+class ChunkResult:
+    text: str
+    position: int
+    total: int
 
-    def load_model(self):
-        if self._model is not None:
-            return self._model
+    @property
+    def finished(self):
+        return self.position >= self.total
 
+
+def get_model():
+    """Carrega o modelo Vosk uma única vez por processo."""
+    global _model
+    with _model_lock:
+        if _model is not None:
+            return _model
+
+        model_path = Path(settings.VOSK_MODEL_PATH)
+        if not model_path.is_dir():
+            logger.error(
+                "Modelo Vosk não encontrado em %s. Rode 'python manage.py download_vosk_model' "
+                "ou ajuste VOSK_MODEL_PATH.", model_path,
+            )
+            raise ModelUnavailableError()
         try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            logger.error("Pacote faster-whisper não instalado: %s", exc)
-            raise ModelUnavailableError() from exc
+            from vosk import Model, SetLogLevel
 
-        logger.info(
-            "Carregando modelo Whisper '%s' (device=%s, compute_type=%s). "
-            "Na primeira execução o modelo pode ser baixado; isso pode demorar.",
-            self.model_name, self.device, self.compute_type,
-        )
-        started = time.monotonic()
-        try:
-            self._model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type)
+            SetLogLevel(-1)  # silencia o log interno (Kaldi)
+            started = time.monotonic()
+            _model = Model(str(model_path))
         except Exception as exc:
-            logger.exception("Falha ao carregar o modelo Whisper '%s'.", self.model_name)
+            logger.exception("Falha ao carregar o modelo Vosk de %s.", model_path)
             raise ModelUnavailableError() from exc
-        logger.info("Modelo carregado em %.1fs.", time.monotonic() - started)
-        return self._model
+        logger.info("Modelo Vosk carregado de %s em %.1fs.", model_path, time.monotonic() - started)
+        return _model
 
-    def transcribe(self, audio_path, on_progress=None):
-        """Transcreve o áudio e devolve o texto com os segmentos em ordem.
 
-        `on_progress(percent)` é chamado a cada segmento com a posição real já
-        transcrita do áudio (0–99). Pode levantar ProcessingAborted para interromper.
-        """
-        model = self.load_model()
-        try:
-            segments, info = model.transcribe(str(audio_path), language=self.language)
-            duration = info.duration or 0
+def _text_of(result_json):
+    return json.loads(result_json).get("text", "").strip()
+
+
+def transcribe_chunk(audio_path, start_position, chunk_seconds=None):
+    """Transcreve a partir de `start_position` (em amostras) e devolve até onde chegou."""
+    model = get_model()
+    from vosk import KaldiRecognizer  # disponível: get_model() já importou o vosk
+
+    chunk_seconds = chunk_seconds or settings.TRANSCRIBE_CHUNK_SECONDS
+    try:
+        with wave.open(str(audio_path), "rb") as wav:
+            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                raise TranscriptionError("O áudio extraído está em um formato inesperado.")
+            rate = wav.getframerate()
+            total = wav.getnframes()
+            position = min(start_position, total)
+            wav.setpos(position)
+
+            recognizer = KaldiRecognizer(model, rate)
+            block_frames = int(rate * BLOCK_SECONDS)
             texts = []
-            for segment in segments:
-                text = segment.text.strip()
-                if text:
-                    texts.append(text)
-                if on_progress and duration > 0:
-                    on_progress(min(99, int(segment.end / duration * 100)))
-        except (ProcessingAborted, ProcessingError):
-            raise
-        except MemoryError as exc:
-            logger.exception("Memória insuficiente ao transcrever %s.", audio_path)
-            raise TranscriptionError("Memória insuficiente para transcrever este vídeo.") from exc
-        except Exception as exc:
-            logger.exception("Falha do Faster-Whisper ao transcrever %s.", audio_path)
-            raise TranscriptionError() from exc
-        return " ".join(texts)
+            started = time.monotonic()
+
+            while position < total:
+                data = wav.readframes(block_frames)
+                if not data:
+                    break
+                position += len(data) // 2
+                elapsed = time.monotonic() - started
+                if recognizer.AcceptWaveform(data):
+                    texts.append(_text_of(recognizer.Result()))
+                    if elapsed >= chunk_seconds:
+                        break  # parou numa pausa natural da fala
+                elif elapsed >= chunk_seconds * HARD_LIMIT_FACTOR:
+                    break
+
+            texts.append(_text_of(recognizer.FinalResult()))
+    except ProcessingError:
+        raise
+    except (wave.Error, EOFError) as exc:
+        logger.exception("Áudio inválido em %s.", audio_path)
+        raise TranscriptionError("O áudio extraído está corrompido.") from exc
+    except MemoryError as exc:
+        logger.exception("Memória insuficiente ao transcrever %s.", audio_path)
+        raise TranscriptionError("Memória insuficiente para transcrever este vídeo.") from exc
+    except OSError:
+        raise
+    except Exception as exc:
+        logger.exception("Falha do Vosk ao transcrever %s.", audio_path)
+        raise TranscriptionError() from exc
+
+    return ChunkResult(text=" ".join(t for t in texts if t), position=position, total=total)

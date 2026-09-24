@@ -201,17 +201,6 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .summary--warning .summary__icon { color: var(--danger-ink); background: var(--danger-soft); }
 .summary--idle .summary__icon { color: var(--secondary-ink); background: var(--secondary-soft); }
 
-.alert {
-  max-width: 720px;
-  margin: 14px auto 0;
-  padding: 14px 18px;
-  font-size: 14px;
-  color: var(--accent-ink);
-  background: var(--accent-soft);
-  border: 1px solid #f8d2bd;
-  border-radius: var(--radius-sm);
-}
-
 /* Estado vazio ------------------------------------------------------------------- */
 
 .empty {

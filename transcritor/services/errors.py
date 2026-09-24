@@ -11,13 +11,5 @@ class ProcessingError(Exception):
         super().__init__(self.user_message)
 
 
-class ProcessingAborted(Exception):
-    """Interrupção controlada do processamento (não é um erro do vídeo)."""
-
-
-class VideoDeletedError(ProcessingAborted):
-    """O vídeo foi removido (ex.: "Limpar vídeos") enquanto era processado."""
-
-
-class WorkerStopRequested(ProcessingAborted):
-    """O worker recebeu um pedido de encerramento; o vídeo volta para a fila."""
+class InvalidStateError(Exception):
+    """A etapa pedida não combina com o status atual do vídeo (ex.: já concluído)."""

@@ -3,34 +3,36 @@
 Aplicação Django de página única que transforma vídeos em texto:
 
 1. você escolhe um ou vários vídeos;
-2. o navegador envia os arquivos um por vez;
-3. um **worker separado** extrai o áudio com **FFmpeg** e transcreve com **Faster-Whisper**, sempre **um vídeo de cada vez**;
-4. a transcrição aparece no card do vídeo, com um botão para copiar.
+2. a página envia e processa **um vídeo de cada vez**: extrai o áudio com **FFmpeg** e transcreve com **Vosk**;
+3. o texto aparece no card do vídeo enquanto é gerado, e no final surge um botão para copiar.
 
 Stack: Python 3.10+, Django 5.2, SQLite, templates Django, HTML/CSS/JavaScript puro.
-Dependências Python: apenas `Django` e `faster-whisper`. O projeto não usa Celery, Redis, WebSockets, Docker nem GPU.
+Dependências Python: apenas `Django` e `vosk`. O projeto não precisa de worker, fila, Celery, Redis, Docker nem GPU, e cabe no **plano gratuito do PythonAnywhere**.
+
+> **Sobre a qualidade:** o Vosk é leve (modelo de 51 MB, roda em qualquer CPU), mas o texto sai **sem pontuação, tudo em minúsculas e com alguns erros**. A ideia é copiar o resultado e pedir a uma IA (ChatGPT, Claude, Gemini...) para pontuar e corrigir.
 
 ---
 
 ## Como funciona
 
+Sem processos em segundo plano: **o navegador conduz o processamento** com várias requisições curtas.
+
 ```text
-Navegador ──upload (1 arquivo por requisição)──▶ Django ──▶ SQLite (status PENDING)
-    ▲                                                          │
-    └──── polling a cada 3 s (/api/videos/status/) ◀───────────┤
-                                                               ▼
-                               python manage.py process_videos (worker)
-                               PENDING → EXTRACTING_AUDIO → TRANSCRIBING → COMPLETED
-                                                                         ↘ ERROR
+Para cada vídeo, em ordem:
+  1. POST /api/videos/upload/                → salva o vídeo e gera a miniatura (PENDING)
+  2. POST /api/videos/<id>/extract/          → extrai o áudio (WAV) e APAGA o vídeo (TRANSCRIBING)
+  3. POST /api/videos/<id>/transcribe/  (×N) → transcreve ~10 s de processamento por vez,
+                                               parando numa pausa da fala, até COMPLETED
 ```
 
-- **A requisição de upload nunca transcreve.** Ela valida e salva o arquivo, gera a thumbnail (um único frame, é rápido), cria o registro como `PENDING` e responde.
-- **O worker** é um processo à parte. Ele pega o vídeo pendente mais antigo com um `UPDATE ... WHERE status='PENDING'` atômico (dois workers não conseguem pegar o mesmo vídeo) e o processa até o fim antes de pegar o próximo.
-- **O modelo Whisper é carregado uma única vez**, quando o worker inicia, e reaproveitado para todos os vídeos.
-- **O áudio é temporário**: é um WAV mono de 16 kHz, apagado assim que o processamento termina (com sucesso ou erro).
-- **Progresso real**: durante a transcrição, o percentual indica a posição do áudio já transcrita. Na extração de áudio não há métrica confiável, então a interface mostra um indicador animado, sem percentual inventado.
-- **Worker parado**: o worker grava um sinal de vida (heartbeat) a cada 10 s. Se ele parar, a interface avisa que os vídeos estão na fila, esperando o processador.
-- **Sessão**: não há login. Cada navegador vê e limpa apenas os seus próprios vídeos, identificados por um cookie de sessão. A fila do worker, porém, é compartilhada entre todos.
+- **Requisições curtas:** cada pedaço leva ~10 s e para numa pausa da fala, para não cortar palavras. O PythonAnywhere encerra requisições com mais de 5 minutos, e aqui nenhuma chega perto disso.
+- **Progresso real:** o percentual indica quanto do áudio já foi transcrito. Durante a extração do áudio não há métrica confiável, então aparece só um indicador animado.
+- **Retomável:** o avanço fica salvo no banco. Se a página for fechada, o vídeo aparece como **Pausado**; é só clicar em **Transcrever vídeos** para continuar de onde parou.
+- **Pouco disco:** o vídeo é apagado logo após a extração do áudio. O áudio temporário (~1,9 MB por minuto) é apagado ao terminar. Ficam só a miniatura e o texto.
+- **Por que não há worker:** no plano gratuito do PythonAnywhere não existem Always-on Tasks nem tarefas agendadas, e processos em console têm cota de 100 s de CPU por dia. Requisições web não entram nessa cota.
+- **Sessão:** não há login. Cada navegador vê e limpa apenas os próprios vídeos, identificados por um cookie de sessão.
+
+**A página precisa ficar aberta** enquanto os vídeos são processados. Se você tentar sair no meio, o navegador pede confirmação.
 
 ---
 
@@ -38,6 +40,7 @@ Navegador ──upload (1 arquivo por requisição)──▶ Django ──▶ SQ
 
 - **Python 3.10 ou superior**
 - **FFmpeg** (executável `ffmpeg`)
+- **Modelo Vosk em português** (baixado com um comando, veja abaixo)
 
 ### FFmpeg
 
@@ -47,29 +50,13 @@ Para verificar se está instalado:
 ffmpeg -version
 ```
 
-**Windows** (uma das opções):
+**Windows:** `winget install Gyan.FFmpeg`. Depois, feche e abra o terminal. Outra opção é baixar o build em https://www.gyan.dev/ffmpeg/builds/ e adicionar a pasta `bin` ao `PATH`.
 
-```bash
-winget install Gyan.FFmpeg
-```
+**Linux (Debian/Ubuntu):** `sudo apt install ffmpeg`
 
-Depois, feche e abra o terminal. Outra opção é baixar o build em https://www.gyan.dev/ffmpeg/builds/, extrair e adicionar a pasta `bin` ao `PATH`.
+**PythonAnywhere:** já vem instalado.
 
-**Linux (Debian/Ubuntu):**
-
-```bash
-sudo apt update && sudo apt install ffmpeg
-```
-
-**Se o `ffmpeg` não estiver no PATH**, informe o caminho completo no `.env`:
-
-```env
-FFMPEG_BINARY=C:\ffmpeg\bin\ffmpeg.exe
-# ou
-FFMPEG_BINARY=/usr/local/bin/ffmpeg
-```
-
-Se o FFmpeg não for encontrado, o worker registra isso no log ao iniciar. O vídeo recebe a mensagem "O FFmpeg não foi encontrado no servidor…".
+Se o executável estiver fora do PATH, informe o caminho no `.env`: `FFMPEG_BINARY=C:\ffmpeg\bin\ffmpeg.exe`.
 
 ---
 
@@ -84,49 +71,23 @@ Ative o ambiente virtual:
 ```bash
 # Windows (PowerShell)
 venv\Scripts\Activate.ps1
-# Windows (cmd)
-venv\Scripts\activate.bat
 # Linux / macOS
 source venv/bin/activate
 ```
 
-Instale as dependências e crie a configuração:
+Instale as dependências, crie a configuração e baixe o modelo:
 
 ```bash
 pip install -r requirements.txt
-copy .env.example .env      # Windows
-cp .env.example .env        # Linux
-```
-
-O `.env.example` vem com `DEBUG=True`, pronto para desenvolvimento. Com `DEBUG=False`, a aplicação exige uma `SECRET_KEY` própria.
-
-Crie o banco e execute:
-
-```bash
+copy .env.example .env      # Windows (no Linux: cp .env.example .env)
+python manage.py download_vosk_model
 python manage.py migrate
 python manage.py runserver
 ```
 
-Acesse http://127.0.0.1:8000.
+Acesse http://127.0.0.1:8000. Não há mais nada para iniciar.
 
-### Worker local
-
-Em **outro terminal**, com o mesmo ambiente virtual ativo:
-
-```bash
-python manage.py process_videos
-```
-
-Deixe-o rodando. Ele consulta a fila a cada `WORKER_POLL_INTERVAL` segundos. Para encerrar, use `Ctrl+C`: o vídeo em andamento volta para a fila e será reprocessado na próxima execução.
-
-Opções:
-
-| Opção | Efeito |
-|---|---|
-| `--once` | Processa todos os vídeos pendentes e encerra (para tarefas agendadas). |
-| `--interval N` | Espera N segundos entre consultas quando a fila está vazia. |
-
-Só pode existir **um worker por vez**: se outro já estiver rodando, o comando avisa e encerra. Se o worker cair no meio de um vídeo, o próximo worker a iniciar devolve esse vídeo para a fila.
+O `.env.example` vem com `DEBUG=True`, pronto para desenvolvimento. Com `DEBUG=False`, a aplicação exige uma `SECRET_KEY` própria.
 
 ### Testes
 
@@ -134,32 +95,17 @@ Só pode existir **um worker por vez**: se outro já estiver rodando, o comando 
 python manage.py test transcritor
 ```
 
+Se o FFmpeg e o modelo estiverem instalados, os testes também rodam o fluxo completo de verdade.
+
 ---
 
-## Faster-Whisper
+## Vosk (transcrição)
 
-- Na **primeira execução**, o worker **baixa o modelo** escolhido do Hugging Face (o `base` tem ~145 MB). Isso pode levar alguns minutos. Depois o modelo fica em cache (`~/.cache/huggingface`) e não é baixado de novo.
-- A transcrição roda em **CPU**, o que é **mais lento** que em GPU. Como referência, o modelo `base` em CPU comum leva de alguns segundos a poucos minutos por minuto de áudio, dependendo da máquina. **Vídeos longos podem demorar bastante.**
-- **`base` + `cpu` + `int8` é a configuração padrão**, pensada para servidores simples e de baixo custo.
-
-Para trocar, edite o `.env` e **reinicie o worker**:
-
-```env
-WHISPER_MODEL=small           # tiny | base | small | medium | large-v3 | turbo ...
-WHISPER_DEVICE=cpu            # cpu | cuda (só com GPU NVIDIA e bibliotecas CUDA)
-WHISPER_COMPUTE_TYPE=int8     # int8 (CPU) | float16 (GPU) | float32
-WHISPER_LANGUAGE=pt           # código do idioma, ou "auto" para detectar
-```
-
-Modelos maiores ficam mais precisos, mas também mais lentos e consomem mais memória. Em CPU, `tiny`, `base` e `small` são as opções realistas.
-
-`WHISPER_MODEL` também aceita **o caminho de uma pasta com o modelo já baixado**, útil em servidores sem acesso ao Hugging Face:
-
-```bash
-python -c "from faster_whisper import download_model; print(download_model('base', output_dir='modelo-base'))"
-```
-
-Depois, envie a pasta `modelo-base` para o servidor e use `WHISPER_MODEL=/caminho/para/modelo-base`.
+- O modelo padrão é o **`vosk-model-small-pt-0.3`** (31 MB compactado, 51 MB descompactado, licença Apache 2.0). Ele é carregado **uma vez por processo** do servidor e reaproveitado; o primeiro pedaço após reiniciar o servidor demora 1 a 2 s a mais.
+- `python manage.py download_vosk_model` baixa o modelo do site oficial para `models/vosk-model-small-pt-0.3`.
+- Com um `.zip` baixado manualmente, use `python manage.py download_vosk_model --zip caminho/do/arquivo.zip`.
+- Existe um modelo grande em português (`vosk-model-pt-fb-v0.1.1-20220516_2113`, 1,6 GB, licença GPLv3), um pouco mais preciso. Ele **não cabe** no plano gratuito do PythonAnywhere. Para usá-lo em outro servidor, aponte `VOSK_MODEL_PATH` para a pasta dele.
+- Modelos disponíveis: https://alphacephei.com/vosk/models
 
 ---
 
@@ -173,16 +119,13 @@ Elas podem ser definidas no ambiente do sistema ou no arquivo `.env` na raiz do 
 | `SECRET_KEY` | — | Chave secreta do Django. Obrigatória quando `DEBUG=False`. |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Domínios aceitos, separados por vírgula. |
 | `CSRF_TRUSTED_ORIGINS` | vazio | Origens HTTPS confiáveis (ex.: `https://usuario.pythonanywhere.com`). |
-| `WHISPER_MODEL` | `base` | Nome do modelo ou caminho de uma pasta local. |
-| `WHISPER_DEVICE` | `cpu` | `cpu` ou `cuda`. |
-| `WHISPER_COMPUTE_TYPE` | `int8` | Precisão do modelo (`int8` é a mais leve em CPU). |
-| `WHISPER_LANGUAGE` | `pt` | Idioma do áudio, ou `auto`. |
-| `MAX_UPLOAD_SIZE_MB` | `500` | Tamanho máximo de cada vídeo. |
+| `VOSK_MODEL_PATH` | `models/vosk-model-small-pt-0.3` | Pasta do modelo Vosk descompactado. |
+| `TRANSCRIBE_CHUNK_SECONDS` | `10` | Segundos de processamento por requisição; cada pedaço termina numa pausa da fala. |
+| `MAX_UPLOAD_SIZE_MB` | `200` | Tamanho máximo de cada vídeo. |
 | `FFMPEG_BINARY` | `ffmpeg` | Nome ou caminho do executável do FFmpeg. |
-| `WORKER_POLL_INTERVAL` | `5` | Segundos entre consultas do worker quando a fila está vazia. |
 | `SECURE_COOKIES` | `True` se `DEBUG=False` | Envia os cookies apenas por HTTPS. |
 | `LOG_LEVEL` | `INFO` | Nível de log da aplicação. |
-| `MEDIA_ROOT` | `<projeto>/media` | Pasta onde vídeos e thumbnails são salvos. |
+| `MEDIA_ROOT` | `<projeto>/media` | Pasta onde vídeos, áudios temporários e miniaturas são salvos. |
 
 Para gerar uma `SECRET_KEY`:
 
@@ -192,41 +135,45 @@ python -c "import secrets; print(secrets.token_urlsafe(50))"
 
 ---
 
-## Deploy no PythonAnywhere
+## Deploy no PythonAnywhere (plano gratuito)
 
-Nos exemplos abaixo, troque `USUARIO` pelo seu nome de usuário do PythonAnywhere.
+Nos exemplos, troque `USUARIO` pelo seu nome de usuário.
 
-### 0. Conta e plano
+**Uso de disco:** ~100 MB de dependências + 51 MB do modelo. Sobram cerca de 350 MB dos 512 MB do plano gratuito, usados só temporariamente pelo vídeo que está sendo processado.
 
-Crie a conta em https://www.pythonanywhere.com. Pontos importantes de cada plano (confira os limites atuais na página de preços):
+### 1. Conta e código
 
-- **Always-on Tasks**, que mantêm o worker rodando 24 h, só existem nos **planos pagos**. É o modo recomendado.
-- **Plano gratuito**: tem pouco disco (o ambiente virtual com `faster-whisper` ocupa ~350 MB, fora o modelo e os vídeos), cota diária de CPU pequena, acesso à internet restrito a uma lista de sites e tarefas agendadas só uma vez por dia. Funciona para testes com vídeos curtos, mas não para uso contínuo. Veja o passo 10.
-
-### 1. Código
-
-Abra um **Bash console** e envie o código, por git ou pelo upload da aba *Files*:
+Crie a conta gratuita ("Beginner") em https://www.pythonanywhere.com. Abra um **Bash console** e envie o código. O GitHub está liberado no plano gratuito:
 
 ```bash
 cd ~
-git clone <URL-do-seu-repositorio> transcritor
+git clone https://github.com/<seu-usuario>/<seu-repositorio>.git transcritor
 cd transcritor
 ```
 
-### 2. Ambiente virtual
+Se preferir, envie os arquivos pela aba **Files**.
+
+### 2. Ambiente virtual e dependências
 
 ```bash
 mkvirtualenv --python=/usr/bin/python3.12 transcritor-venv
-```
-
-Qualquer versão a partir da 3.10 serve. O ambiente fica em `~/.virtualenvs/transcritor-venv` e é ativado automaticamente. Para ativá-lo depois: `workon transcritor-venv`.
-
-### 3. Dependências
-
-```bash
-cd ~/transcritor
 pip install -r requirements.txt
 ```
+
+Qualquer versão a partir da 3.10 serve. Para reativar o ambiente depois: `workon transcritor-venv`.
+
+### 3. Modelo Vosk (envio manual)
+
+O site do Vosk (`alphacephei.com`) **não está liberado** no plano gratuito, então o download direto falha. Faça assim:
+
+1. No seu computador, baixe https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip (31 MB).
+2. Na aba **Files** do PythonAnywhere, envie o `.zip` para `/home/USUARIO/`.
+3. No Bash console:
+   ```bash
+   cd ~/transcritor
+   python manage.py download_vosk_model --zip ~/vosk-model-small-pt-0.3.zip
+   rm ~/vosk-model-small-pt-0.3.zip
+   ```
 
 ### 4. Configuração (`.env`)
 
@@ -244,15 +191,15 @@ ALLOWED_HOSTS=USUARIO.pythonanywhere.com
 CSRF_TRUSTED_ORIGINS=https://USUARIO.pythonanywhere.com
 ```
 
-### 5. Banco de dados, estáticos e pastas
+### 5. Banco de dados e arquivos estáticos
 
 ```bash
-python manage.py migrate          # cria o db.sqlite3 e as tabelas
+python manage.py migrate
 python manage.py collectstatic --noinput
 python manage.py check --deploy
 ```
 
-O banco SQLite fica em `~/transcritor/db.sqlite3`. Os vídeos ficam em `~/transcritor/media/`, que é o `MEDIA_ROOT`.
+O banco SQLite fica em `~/transcritor/db.sqlite3`, e o `MEDIA_ROOT` em `~/transcritor/media/`.
 
 ### 6. Web App
 
@@ -260,13 +207,15 @@ Na aba **Web**, clique em **Add a new web app** → **Manual configuration** (n�
 
 Na página do Web App:
 
-- **Virtualenv**: `/home/USUARIO/.virtualenvs/transcritor-venv`
-- **Source code**: `/home/USUARIO/transcritor`
-- **Force HTTPS**: ativado. Isso resolve os avisos de HTTPS do `check --deploy`.
+- **Virtualenv:** `/home/USUARIO/.virtualenvs/transcritor-venv`
+- **Source code:** `/home/USUARIO/transcritor`
+- **Force HTTPS:** ativado
+- **Static files:** URL `/static/` → Directory `/home/USUARIO/transcritor/staticfiles`
+  (**não** mapeie `/media/`: os vídeos não devem ser públicos, e as miniaturas passam por uma view que confere o dono)
 
 ### 7. Arquivo WSGI
 
-Clique no link do **WSGI configuration file** (algo como `/var/www/USUARIO_pythonanywhere_com_wsgi.py`), apague o conteúdo e use:
+Clique no link do **WSGI configuration file**, apague o conteúdo e use:
 
 ```python
 import os
@@ -285,96 +234,32 @@ application = get_wsgi_application()
 
 O `settings.py` lê o `.env` sozinho, então não é preciso repetir as variáveis aqui.
 
-### 8. Arquivos estáticos e mídia
+### 8. Testar
 
-Na seção **Static files** do Web App:
+Clique em **Reload**, abra `https://USUARIO.pythonanywhere.com`, escolha um vídeo curto e clique em **Transcrever vídeos**. O card deve passar por *Enviando → Extraindo áudio → Transcrevendo (x%) → Transcrição concluída*.
 
-| URL | Directory |
-|---|---|
-| `/static/` | `/home/USUARIO/transcritor/staticfiles` |
-
-**Não mapeie `/media/`.** Os vídeos não devem ser públicos. As thumbnails passam por uma view que confere o dono do vídeo.
-
-Clique em **Reload** e abra `https://USUARIO.pythonanywhere.com`.
-
-### 9. FFmpeg
-
-O FFmpeg costuma já estar disponível nos servidores do PythonAnywhere. Confira no Bash console:
-
-```bash
-ffmpeg -version
-```
-
-Se ele não existir ou estiver em outro caminho, instale um build estático na sua pasta e aponte para ele no `.env`:
-
-```env
-FFMPEG_BINARY=/home/USUARIO/bin/ffmpeg
-```
-
-Depois, **reinicie o worker**.
-
-### 10. Worker
-
-O worker precisa rodar **fora** da aplicação web: processos iniciados dentro de uma requisição não sobrevivem ao fim dela.
-
-Comando do worker:
-
-```bash
-/home/USUARIO/.virtualenvs/transcritor-venv/bin/python /home/USUARIO/transcritor/manage.py process_videos
-```
-
-Antes de configurá-lo como tarefa, **rode esse comando uma vez no Bash console**. Assim você baixa o modelo Whisper (na primeira vez) e confirma no log que o FFmpeg e o modelo foram carregados. Depois, encerre com `Ctrl+C`.
-
-**Plano pago (recomendado): Always-on Task**
-
-1. Aba **Tasks** → seção **Always-on tasks** → cole o comando acima → **Create**.
-2. O PythonAnywhere mantém o processo rodando e o reinicia se ele cair.
-3. **Reiniciar o worker** (necessário depois de mudar o `.env` ou atualizar o código): use o botão de **restart** da tarefa, ou **stop** seguido de **start**.
-4. **Logs**: clique no ícone de log da tarefa.
-
-**Sem Always-on Tasks (plano gratuito)**
-
-A arquitetura continua a mesma. Só muda quem inicia o worker:
-
-- **Tarefa agendada**: na aba **Tasks** → **Scheduled tasks**, agende o mesmo comando com `--once`. Ele processa a fila e encerra:
-  ```bash
-  /home/USUARIO/.virtualenvs/transcritor-venv/bin/python /home/USUARIO/transcritor/manage.py process_videos --once
-  ```
-  Os vídeos esperam na fila até a próxima execução (uma vez por dia no plano gratuito). Se uma execução encontrar outra ainda rodando, ela apenas encerra.
-- **Manual**: rode `python manage.py process_videos --once` num Bash console sempre que houver vídeos na fila.
-
-Enquanto o worker não estiver ativo, a interface mostra o aviso "O processador de vídeos não está ativo no momento" e mantém os vídeos na fila.
-
-**Modelo Whisper no plano gratuito**: se o download do Hugging Face for bloqueado pela lista de sites permitidos, baixe o modelo no seu computador, envie a pasta pela aba *Files* e use `WHISPER_MODEL=/home/USUARIO/modelo-base`. Veja a seção Faster-Whisper.
-
-### 11. Testar
-
-1. Abra o site, escolha um vídeo curto e clique em **Transcrever vídeos**.
-2. O card deve passar por *Enviando → Aguardando processamento → Extraindo áudio → Transcrevendo → Transcrição concluída*.
-3. Se ficar parado em *Aguardando processamento*, confira se o worker está rodando (passo 10).
-
-### 12. Logs
+### 9. Logs
 
 | Onde | O que aparece |
 |---|---|
-| Web → **Error log** | Erros e logs da aplicação web (uploads, limpeza, exceções). |
-| Web → **Server log** | Inicialização e reinícios do servidor web. |
+| Web → **Error log** | Logs da aplicação: vídeos recebidos, erros do FFmpeg/Vosk, limpezas. |
+| Web → **Server log** | Inicialização e reinícios do servidor. |
 | Web → **Access log** | Requisições HTTP. |
-| Tasks → log da tarefa | Tudo do worker: vídeos processados, erros do FFmpeg/Whisper, tempo gasto. |
 
-Para ver mais detalhes, defina `LOG_LEVEL=DEBUG` no `.env` e reinicie o Web App e o worker.
+Para ver mais detalhes, defina `LOG_LEVEL=DEBUG` no `.env` e clique em **Reload**.
 
-### Atualizar a aplicação
+### Manutenção
 
-```bash
-cd ~/transcritor && git pull
-workon transcritor-venv
-pip install -r requirements.txt
-python manage.py migrate
-python manage.py collectstatic --noinput
-```
-
-Depois, clique em **Reload** na aba Web e **reinicie o worker**.
+- **Plano gratuito:** o PythonAnywhere desativa o Web App se ele não for renovado periodicamente. Entre na aba **Web** e clique no botão de estender a validade quando o aviso aparecer.
+- **Atualizar a aplicação:**
+  ```bash
+  cd ~/transcritor && git pull
+  workon transcritor-venv
+  pip install -r requirements.txt
+  python manage.py migrate
+  python manage.py collectstatic --noinput
+  ```
+  Depois, clique em **Reload**.
 
 ---
 
@@ -386,35 +271,36 @@ Depois, clique em **Reload** na aba Web e **reinicie o worker**.
 ├── .env.example
 ├── config/                      # settings, urls, wsgi
 ├── transcritor/
-│   ├── models.py                # Video (status, arquivos, transcrição)
-│   ├── views.py                 # página + API JSON (upload, status, limpar, transcrição, thumbnail)
+│   ├── models.py                # Video (status, arquivos, posição no áudio, transcrição)
+│   ├── views.py                 # página + API JSON (upload, extrair, transcrever, limpar, miniatura)
 │   ├── forms.py                 # validação do upload (extensão, tamanho, MIME, assinatura do arquivo)
 │   ├── middleware.py            # recusa uploads grandes antes de ler o corpo
 │   ├── services/
-│   │   ├── ffmpeg.py            # extração de áudio e thumbnail (subprocess, sem shell)
-│   │   ├── transcription.py     # Faster-Whisper (modelo carregado uma vez)
-│   │   ├── processor.py         # fila, processamento de um vídeo, limpeza
-│   │   └── worker.py            # loop do worker, lock de instância única, heartbeat
-│   ├── management/commands/process_videos.py
+│   │   ├── ffmpeg.py            # extração de áudio e miniatura (subprocess, sem shell)
+│   │   ├── transcription.py     # Vosk: modelo carregado uma vez, transcrição em pedaços
+│   │   └── processor.py         # etapas do processamento e limpeza
+│   ├── management/commands/download_vosk_model.py
 │   └── tests.py
 ├── templates/                   # index.html, 404.html, 500.html
 ├── static/                      # css/style.css, js/app.js, img/
-└── media/                       # videos/, thumbnails/, audio/ (temporário)
+├── models/                      # modelo Vosk (não versionado)
+└── media/                       # videos/, audio/ (temporários), thumbnails/
 ```
 
 ## Segurança
 
-- CSRF em todos os POSTs; alterações e exclusões só via POST e só nos vídeos da própria sessão.
+- CSRF em todos os POSTs; cada etapa só age sobre vídeos da própria sessão.
 - Upload validado por extensão, tamanho, MIME type e **assinatura binária do arquivo** (MP4/MOV, WebM/MKV, AVI).
 - O nome enviado pelo usuário serve só para exibição. No disco, o arquivo recebe um nome aleatório (UUID), o que impede path traversal.
 - O FFmpeg é chamado com lista de argumentos, sem `shell=True`.
 - Com `DEBUG=False`, nenhuma stack trace chega ao navegador. As mensagens para o usuário são amigáveis, e os detalhes técnicos vão para os logs.
+- Duas abas processando o mesmo vídeo não duplicam texto: cada pedaço só é salvo se a posição no áudio não mudou no meio tempo.
 
 ## Limitações conhecidas
 
-- A transcrição em CPU é lenta para vídeos longos, e cada vídeo espera o anterior terminar. Isso é intencional.
-- SQLite atende bem poucos usuários simultâneos. Não é indicado para alto volume.
-- Não há login: quem usa o mesmo navegador (a mesma sessão) vê os mesmos vídeos. Os vídeos ficam guardados até alguém clicar em **Limpar vídeos**.
-- O lock de instância única do worker vale para uma máquina. Rode apenas um worker.
-- Uploads grandes dependem também dos limites do servidor e do plano de hospedagem.
-- A miniatura exibida antes do envio é gerada pelo navegador. Formatos que o navegador não reproduz (ex.: AVI) mostram um placeholder até o servidor gerar a thumbnail.
+- **Qualidade do Vosk:** texto sem pontuação e com erros. Revise com outra IA.
+- **A página precisa ficar aberta** durante o processamento. Se fechar, é só retomar depois.
+- No plano gratuito, o servidor tem poucos processos web. Enquanto um pedaço é transcrito (~10 s), outras requisições podem esperar. É suficiente para poucas pessoas.
+- A velocidade depende da CPU do servidor. Na máquina de testes, cada minuto de áudio levou ~20 s. No PythonAnywhere tende a ser mais lento.
+- Uploads grandes dependem também dos limites do servidor. Vídeos muito grandes podem ser recusados antes de chegar ao Django.
+- A miniatura exibida antes do envio é gerada pelo navegador. Formatos que ele não reproduz (ex.: AVI) mostram um placeholder até o servidor gerar a miniatura.

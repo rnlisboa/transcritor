@@ -1,8 +1,8 @@
 """Views da página única e da API JSON consumida pelo frontend.
 
-O upload apenas salva o arquivo, gera a thumbnail (um único frame, rápido) e
-deixa o vídeo como PENDING. A transcrição acontece no worker
-(`python manage.py process_videos`), nunca dentro de uma requisição.
+Não há worker nem fila em segundo plano: o navegador envia um vídeo e depois
+pede cada etapa (extrair áudio, transcrever o próximo pedaço) em requisições
+curtas, um vídeo de cada vez. Todo o estado fica no banco.
 """
 import errno
 import logging
@@ -11,7 +11,6 @@ from pathlib import Path
 
 from django.conf import settings
 from django.db import DatabaseError
-from django.db.models.functions import Length
 from django.http import FileResponse, Http404, JsonResponse, UnreadablePostError
 from django.shortcuts import get_object_or_404, render
 from django.urls import reverse
@@ -21,7 +20,7 @@ from django.views.decorators.http import require_GET, require_POST
 from .forms import VideoUploadForm
 from .models import Video
 from .services import ffmpeg, processor
-from .services.worker import worker_is_online
+from .services.errors import InvalidStateError
 
 logger = logging.getLogger(__name__)
 
@@ -37,49 +36,23 @@ def _owner_key(request, create=False):
     return key
 
 
-def _json_error(message, status):
-    return JsonResponse({"error": message}, status=status)
+def _own_video(request, video_id):
+    return get_object_or_404(Video, pk=video_id, owner_key=_owner_key(request) or "")
 
 
-def _serialize(video, queue_position=None):
+def _json_error(message, status, **extra):
+    return JsonResponse({"error": message, **extra}, status=status)
+
+
+def _serialize(video):
     return {
         "id": video.pk,
         "name": video.original_name,
         "status": video.status,
-        "status_label": video.get_status_display(),
         "progress": video.progress,
         "error": video.error_message or None,
-        "is_completed": video.status == Video.Status.COMPLETED,
-        "has_transcription": bool(getattr(video, "transcription_length", len(video.transcription))),
+        "transcription": video.transcription,
         "thumbnail_url": reverse("transcritor:thumbnail", args=[video.pk]) if video.thumbnail else None,
-        "queue_position": queue_position,
-    }
-
-
-def _queue_positions():
-    """Quantos vídeos estão à frente de cada vídeo ativo na fila global do worker."""
-    active = list(
-        Video.objects.filter(status__in=Video.ACTIVE_STATUSES)
-        .order_by("created_at", "id")
-        .values_list("id", "status")
-    )
-    ordered = [vid for vid, status in active if status != Video.Status.PENDING]
-    ordered += [vid for vid, status in active if status == Video.Status.PENDING]
-    return {vid: index for index, vid in enumerate(ordered)}
-
-
-def _status_payload(owner_key):
-    videos = []
-    if owner_key:
-        videos = list(
-            Video.objects.filter(owner_key=owner_key)
-            .defer("transcription")
-            .annotate(transcription_length=Length("transcription"))
-        )
-    positions = _queue_positions() if any(v.status in Video.ACTIVE_STATUSES for v in videos) else {}
-    return {
-        "videos": [_serialize(v, positions.get(v.pk)) for v in videos],
-        "worker_online": worker_is_online(),
     }
 
 
@@ -87,18 +60,18 @@ def _status_payload(owner_key):
 @ensure_csrf_cookie
 def index(request):
     owner_key = _owner_key(request, create=True)
+    urls = {
+        name: reverse(f"transcritor:{name}", args=[0])
+        for name in ("extract", "transcribe")
+    }
+    urls.update(upload=reverse("transcritor:upload"), clear=reverse("transcritor:clear"))
     context = {
         "app_config": {
             "maxUploadSizeBytes": settings.MAX_UPLOAD_SIZE_BYTES,
             "maxUploadSizeMb": settings.MAX_UPLOAD_SIZE_MB,
             "allowedExtensions": settings.ALLOWED_VIDEO_EXTENSIONS,
-            "urls": {
-                "upload": reverse("transcritor:upload"),
-                "status": reverse("transcritor:status"),
-                "clear": reverse("transcritor:clear"),
-                "transcription": reverse("transcritor:transcription", args=[0]),
-            },
-            "initialStatus": _status_payload(owner_key),
+            "urls": urls,
+            "videos": [_serialize(v) for v in Video.objects.filter(owner_key=owner_key)],
         },
         "accept": ",".join(settings.ALLOWED_VIDEO_EXTENSIONS),
         "formats_label": ", ".join(ext.lstrip(".").upper() for ext in settings.ALLOWED_VIDEO_EXTENSIONS),
@@ -137,7 +110,7 @@ def upload_video(request):
 
     _attach_thumbnail(video)
     logger.info("Vídeo #%s recebido: %s (%s bytes).", video.pk, video.original_name, video.video_file.size)
-    return JsonResponse({"video": _serialize(video, queue_position=_queue_positions().get(video.pk))}, status=201)
+    return JsonResponse({"video": _serialize(video)}, status=201)
 
 
 def _attach_thumbnail(video):
@@ -156,16 +129,36 @@ def _storage_error_response(exc):
     return _json_error("Não foi possível salvar o vídeo no servidor. Tente novamente.", 500)
 
 
-@require_GET
-def videos_status(request):
+def _run_step(request, video_id, step):
+    """Executa uma etapa do processamento e devolve o estado atualizado do vídeo.
+
+    Erros de processamento não viram erro HTTP: ficam registrados no vídeo
+    (status ERROR + mensagem amigável) e voltam no JSON.
+    """
+    video = _own_video(request, video_id)
     try:
-        payload = _status_payload(_owner_key(request))
+        step(video)
+    except InvalidStateError:
+        video.refresh_from_db()
+        return _json_error("Esta etapa não se aplica ao estado atual do vídeo.", 409, video=_serialize(video))
     except DatabaseError:
-        logger.exception("Erro de banco ao consultar o status.")
-        return _json_error("Não foi possível consultar o status agora.", 503)
-    response = JsonResponse(payload)
-    response["Cache-Control"] = "no-store"
-    return response
+        logger.exception("Erro de banco ao processar o vídeo #%s.", video_id)
+        return _json_error("O servidor está ocupado. Tentando novamente...", 503)
+    try:
+        video.refresh_from_db()
+    except Video.DoesNotExist:
+        raise Http404
+    return JsonResponse({"video": _serialize(video)})
+
+
+@require_POST
+def extract_audio(request, video_id):
+    return _run_step(request, video_id, processor.extract_audio)
+
+
+@require_POST
+def transcribe_chunk(request, video_id):
+    return _run_step(request, video_id, processor.transcribe_next_chunk)
 
 
 @require_POST
@@ -182,16 +175,8 @@ def clear_all_videos(request):
 
 
 @require_GET
-def video_transcription(request, video_id):
-    video = get_object_or_404(Video, pk=video_id, owner_key=_owner_key(request) or "")
-    if video.status != Video.Status.COMPLETED:
-        return _json_error("A transcrição ainda não está pronta.", 409)
-    return JsonResponse({"id": video.pk, "transcription": video.transcription})
-
-
-@require_GET
 def video_thumbnail(request, video_id):
-    video = get_object_or_404(Video, pk=video_id, owner_key=_owner_key(request) or "")
+    video = _own_video(request, video_id)
     if not video.thumbnail:
         raise Http404
     try:

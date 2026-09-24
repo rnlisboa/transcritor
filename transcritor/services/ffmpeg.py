@@ -10,7 +10,9 @@ from .errors import ProcessingError
 logger = logging.getLogger(__name__)
 
 THUMBNAIL_TIMEOUT_SECONDS = 30
-EXTRACTION_TIMEOUT_SECONDS = 6 * 60 * 60
+# Roda dentro de uma requisição: precisa terminar antes do limite do servidor
+# (o PythonAnywhere encerra requisições com mais de 5 minutos).
+EXTRACTION_TIMEOUT_SECONDS = 240
 WAV_HEADER_SIZE = 44
 
 
@@ -68,24 +70,10 @@ def _run(args, timeout, failure_message):
         raise FFmpegError(_friendly_message(stderr, failure_message)) from exc
 
 
-def check_available():
-    """Retorna a primeira linha de `ffmpeg -version` ou levanta FFmpegNotFoundError."""
-    try:
-        result = subprocess.run(
-            [settings.FFMPEG_BINARY, "-version"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.error("FFmpeg indisponível (FFMPEG_BINARY=%r): %s", settings.FFMPEG_BINARY, exc)
-        raise FFmpegNotFoundError() from exc
-    return (result.stdout.splitlines() or ["ffmpeg"])[0]
-
-
 def extract_audio(video_path, audio_path):
-    """Extrai a primeira trilha de áudio como WAV mono 16 kHz (formato nativo do Whisper).
+    """Extrai a primeira trilha de áudio como WAV mono 16 kHz, o formato que o Vosk espera.
 
-    Mono/16 kHz deixa o arquivo ~6x menor que o áudio original em estéreo 48 kHz
-    sem perda relevante para transcrição.
+    Mono/16 kHz ocupa ~1,9 MB por minuto, sem perda relevante para transcrição.
     """
     video_path, audio_path = Path(video_path), Path(audio_path)
     if not video_path.is_file():

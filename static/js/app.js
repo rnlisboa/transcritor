@@ -1,19 +1,26 @@
-/* Transcritor da Gabi — frontend (JavaScript puro, sem dependências). */
+/* Transcritor da Gabi — frontend (JavaScript puro, sem dependências).
+ *
+ * O navegador conduz o processamento, um vídeo de cada vez:
+ *   enviar → extrair áudio → transcrever em pedaços (várias requisições curtas)
+ * O estado fica no servidor; se a página for fechada, basta clicar em
+ * "Transcrever vídeos" de novo para continuar de onde parou.
+ */
 (() => {
   "use strict";
 
   const config = JSON.parse(document.getElementById("app-config").textContent);
 
-  const POLL_MS = 3000;
-  const POLL_HIDDEN_MS = 10000;
   const COPY_RESET_MS = 2500;
   const PREVIEW_TIMEOUT_MS = 8000;
+  const MAX_ATTEMPTS = 4;
+  const RETRY_DELAY_MS = 2000;
 
   const ICONS = {
     check: '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
     error: '<svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7 7 17"/></svg>',
     clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
     circle: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7.5"/></svg>',
+    pause: '<svg viewBox="0 0 24 24"><path d="M9 7v10M15 7v10"/></svg>',
     info: '<svg viewBox="0 0 24 24"><path d="M12 11v6M12 7.5h.01"/></svg>',
     alert: '<svg viewBox="0 0 24 24"><path d="M12 7.5v6M12 17h.01"/></svg>',
     film: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9.5 4.5 2.5-4.5 2.5z"/></svg>',
@@ -21,7 +28,9 @@
   };
 
   const STATUS = {
-    LOCAL: { label: "Pronto para envio", tone: "idle", icon: "circle" },
+    LOCAL: { label: "Pronto para transcrição", tone: "idle", icon: "circle" },
+    QUEUED: { label: "Aguardando processamento", tone: "waiting", icon: "clock" },
+    PAUSED: { label: "Pausado", tone: "waiting", icon: "pause" },
     UPLOADING: { label: "Enviando vídeo...", tone: "active", icon: "spinner" },
     UPLOAD_ERROR: { label: "Falha no envio", tone: "error", icon: "error" },
     PENDING: { label: "Aguardando processamento", tone: "waiting", icon: "clock" },
@@ -30,9 +39,9 @@
     COMPLETED: { label: "Transcrição concluída", tone: "success", icon: "check" },
     ERROR: { label: "Erro no processamento", tone: "error", icon: "error" },
   };
-  const SERVER_ACTIVE = new Set(["PENDING", "EXTRACTING_AUDIO", "TRANSCRIBING"]);
-  const IN_PROGRESS = new Set(["EXTRACTING_AUDIO", "TRANSCRIBING"]);
-  const SENDABLE = new Set(["LOCAL", "UPLOAD_ERROR"]);
+  // Estados em que ainda há trabalho a fazer (local ou interrompido no servidor).
+  const WORKABLE = new Set(["LOCAL", "UPLOAD_ERROR", "PENDING", "EXTRACTING_AUDIO", "TRANSCRIBING"]);
+  const SERVER_UNFINISHED = new Set(["PENDING", "EXTRACTING_AUDIO", "TRANSCRIBING"]);
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -47,7 +56,6 @@
     summaryIcon: $("summary-icon"),
     summaryTitle: $("summary-title"),
     summaryDetail: $("summary-detail"),
-    workerAlert: $("worker-alert"),
     toasts: $("toasts"),
     dialog: $("confirm-dialog"),
     template: $("card-template"),
@@ -55,27 +63,25 @@
 
   const state = {
     items: [],
-    uploading: false,
-    uploadIndex: 0,
-    uploadTotal: 0,
+    running: false,
+    current: null,
+    attempted: new Set(), // vídeos já tentados na execução atual
     clearing: false,
-    workerOnline: true,
-    pollTimer: null,
-    fetching: false,
-    connectionLost: false,
-    hadActiveWork: false,
     generation: 0, // incrementa a cada limpeza; respostas antigas são descartadas
   };
-  let nextKey = 1;
+
+  class VideoRemovedError extends Error {}
 
   // ---------------------------------------------------------------- utilidades
 
   const plural = (n, singular, pluralForm) => `${n} ${n === 1 ? singular : pluralForm}`;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const extensionOf = (name) => {
     const dot = name.lastIndexOf(".");
     return dot >= 0 ? name.slice(dot).toLowerCase() : "";
   };
   const csrfToken = () => document.querySelector('meta[name="csrf-token"]').content;
+  const urlFor = (name, id) => config.urls[name].replace("/0/", `/${id}/`);
 
   function formatBytes(bytes) {
     if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -121,10 +127,8 @@
 
   function createItem(props) {
     const item = {
-      key: nextKey++,
       file: null,
       serverId: null,
-      adoptedAt: 0,
       name: "",
       size: 0,
       status: "LOCAL",
@@ -133,10 +137,8 @@
       error: null,
       thumbnailUrl: null,
       previewUrl: null,
-      queuePosition: null,
-      hasTranscription: false,
-      transcription: null,
-      loadingTranscription: false,
+      transcription: "",
+      xhr: null,
       el: null,
       copyTimer: null,
       ...props,
@@ -146,6 +148,7 @@
   }
 
   function removeItem(item) {
+    if (item.xhr) item.xhr.abort();
     if (item.el) item.el.root.remove();
     clearTimeout(item.copyTimer);
     state.items = state.items.filter((i) => i !== item);
@@ -157,80 +160,9 @@
     item.status = video.status;
     item.progress = video.progress;
     item.error = video.error;
-    item.queuePosition = video.queue_position;
-    item.hasTranscription = video.has_transcription;
+    item.transcription = video.transcription || "";
     if (video.thumbnail_url) item.thumbnailUrl = video.thumbnail_url;
-    if (video.status !== "COMPLETED") item.transcription = null;
     item.file = null; // já está no servidor; libera a referência ao arquivo local
-  }
-
-  function adoptUploaded(item, video) {
-    // Um polling pode ter trazido este vídeo antes da resposta do upload.
-    const duplicate = state.items.find((i) => i !== item && i.serverId === video.id);
-    if (duplicate) removeItem(duplicate);
-    applyServerData(item, video);
-    item.adoptedAt = performance.now();
-  }
-
-  function mergeStatus(data, { notify, requestStartedAt }) {
-    state.workerOnline = Boolean(data.worker_online);
-    const serverIds = new Set(data.videos.map((v) => v.id));
-
-    for (const item of [...state.items]) {
-      if (item.serverId && !serverIds.has(item.serverId) && item.adoptedAt < requestStartedAt) {
-        removeItem(item);
-      }
-    }
-
-    for (const video of data.videos) {
-      let item = state.items.find((i) => i.serverId === video.id);
-      const previous = item ? item.status : null;
-      if (!item) item = createItem({ adoptedAt: performance.now() });
-      applyServerData(item, video);
-
-      if (notify && previous && previous !== video.status) {
-        if (video.status === "COMPLETED") toast(`Transcrição concluída: ${video.name}`, "success");
-        if (video.status === "ERROR") toast(`Não foi possível processar “${video.name}”.`, "error");
-      }
-      if (video.status === "COMPLETED" && video.has_transcription && item.transcription === null) {
-        loadTranscription(item);
-      }
-    }
-
-    const serverItems = state.items.filter((i) => i.serverId);
-    if (serverItems.some((i) => SERVER_ACTIVE.has(i.status))) {
-      state.hadActiveWork = true;
-    } else if (state.hadActiveWork && !state.uploading) {
-      state.hadActiveWork = false;
-      if (notify) announceFinished(serverItems);
-    }
-    render();
-  }
-
-  function announceFinished(serverItems) {
-    const errors = serverItems.filter((i) => i.status === "ERROR").length;
-    const done = serverItems.filter((i) => i.status === "COMPLETED").length;
-    if (!serverItems.length) return;
-    if (!errors) toast("Todos os vídeos foram transcritos", "success");
-    else toast(`Processamento finalizado: ${done} concluído(s), ${errors} com erro.`, "error");
-  }
-
-  async function loadTranscription(item) {
-    if (item.loadingTranscription || !item.serverId) return;
-    item.loadingTranscription = true;
-    const generation = state.generation;
-    try {
-      const url = config.urls.transcription.replace("/0/", `/${item.serverId}/`);
-      const response = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
-      const data = await readJson(response);
-      if (!response.ok || !data) throw new Error();
-      if (generation === state.generation) item.transcription = data.transcription || "";
-    } catch {
-      item.transcriptionFailed = true;
-    } finally {
-      item.loadingTranscription = false;
-      if (state.items.includes(item)) renderItem(item);
-    }
   }
 
   // ------------------------------------------------------ seleção de arquivos
@@ -262,14 +194,14 @@
         duplicates++;
         continue;
       }
-      const item = createItem({ file, name: file.name, size: file.size, status: "LOCAL" });
-      queuePreview(item);
+      queuePreview(createItem({ file, name: file.name, size: file.size }));
       added++;
     }
 
     render();
     if (added) {
-      toast(`${plural(added, "vídeo adicionado", "vídeos adicionados")}. Clique em “Transcrever vídeos” para começar.`, "success");
+      const hint = state.running ? "Eles entram na fila automaticamente." : "Clique em “Transcrever vídeos” para começar.";
+      toast(`${plural(added, "vídeo adicionado", "vídeos adicionados")}. ${hint}`, "success");
     }
     if (rejected.length === 1) toast(`Arquivo ignorado: ${rejected[0]}.`, "error");
     if (rejected.length > 1) {
@@ -344,7 +276,7 @@
     });
   }
 
-  // ------------------------------------------------------------------ upload
+  // ---------------------------------------------------------- comunicação
 
   function uploadFile(item) {
     return new Promise((resolve, reject) => {
@@ -352,6 +284,7 @@
       form.append("file", item.file, item.file.name);
 
       const xhr = new XMLHttpRequest();
+      item.xhr = xhr;
       xhr.open("POST", config.urls.upload);
       xhr.setRequestHeader("X-CSRFToken", csrfToken());
       xhr.setRequestHeader("Accept", "application/json");
@@ -361,8 +294,10 @@
         item.progress = Math.min(100, Math.round((event.loaded / event.total) * 100));
         item.uploadedBytes = Math.min(item.size, event.loaded);
         renderItem(item);
+        renderSummary();
       });
       xhr.addEventListener("load", () => {
+        item.xhr = null;
         let data = null;
         try {
           data = JSON.parse(xhr.responseText);
@@ -372,7 +307,10 @@
         if (xhr.status >= 200 && xhr.status < 300 && data && data.video) resolve(data.video);
         else reject(new Error((data && data.error) || uploadErrorMessage(xhr.status)));
       });
-      const interrupted = () => reject(new Error("O envio foi interrompido. Verifique sua conexão e tente novamente."));
+      const interrupted = () => {
+        item.xhr = null;
+        reject(new Error("O envio foi interrompido. Verifique sua conexão e tente novamente."));
+      };
       xhr.addEventListener("error", interrupted);
       xhr.addEventListener("abort", interrupted);
       xhr.addEventListener("timeout", interrupted);
@@ -387,98 +325,113 @@
     return "Não foi possível enviar o vídeo. Tente novamente.";
   }
 
-  async function startTranscription() {
-    const queue = state.items.filter((i) => !i.serverId && i.file && SENDABLE.has(i.status));
-    if (!queue.length || state.uploading) return;
+  /** Pede uma etapa ao servidor, com novas tentativas em falhas temporárias. */
+  async function postStep(url) {
+    const resumeHint = "Clique em “Transcrever vídeos” para continuar de onde parou.";
+    for (let attempt = 1; ; attempt++) {
+      let response;
+      let data;
+      try {
+        response = await fetch(url, {
+          method: "POST",
+          headers: { "X-CSRFToken": csrfToken(), Accept: "application/json" },
+        });
+        data = await readJson(response);
+      } catch {
+        if (attempt < MAX_ATTEMPTS) {
+          await sleep(RETRY_DELAY_MS * attempt);
+          continue;
+        }
+        throw new Error(`Sem conexão com o servidor. ${resumeHint}`);
+      }
+      if ((response.ok || response.status === 409) && data && data.video) return data.video;
+      if (response.status === 404) throw new VideoRemovedError();
+      if ([500, 502, 503, 504].includes(response.status) && attempt < MAX_ATTEMPTS) {
+        await sleep(RETRY_DELAY_MS * attempt);
+        continue;
+      }
+      if (response.status === 403) throw new Error("Sua sessão expirou. Recarregue a página para continuar.");
+      throw new Error(`${(data && data.error) || "O servidor não respondeu como esperado."} ${resumeHint}`);
+    }
+  }
 
-    const generation = state.generation;
-    state.uploading = true;
-    state.uploadIndex = 0;
-    state.uploadTotal = queue.length;
-    state.hadActiveWork = true;
-    toast(queue.length === 1 ? "Envio iniciado." : `Envio iniciado: ${queue.length} vídeos.`, "info");
-    render();
+  // ------------------------------------------------------------ processamento
 
-    let sent = 0;
-    let failed = 0;
-    for (const item of queue) {
-      if (generation !== state.generation) break;
-      if (!state.items.includes(item)) continue;
-      state.uploadIndex++;
+  function nextWorkItem() {
+    return state.items.find((i) => WORKABLE.has(i.status) && !state.attempted.has(i));
+  }
+
+  async function processItem(item, generation) {
+    if (!item.serverId) {
       Object.assign(item, { status: "UPLOADING", progress: 0, uploadedBytes: 0, error: null });
       render();
       try {
-        const video = await uploadFile(item);
-        if (generation !== state.generation) break;
-        adoptUploaded(item, video);
-        sent++;
-        if (!state.pollTimer && !state.fetching) schedulePoll();
+        applyServerData(item, await uploadFile(item));
       } catch (err) {
+        if (generation !== state.generation) return;
         Object.assign(item, { status: "UPLOAD_ERROR", progress: null, error: friendlyMessage(err, uploadErrorMessage(0)) });
-        failed++;
+        return;
       }
+    }
+
+    if (item.status === "PENDING" || item.status === "EXTRACTING_AUDIO") {
+      item.status = "EXTRACTING_AUDIO";
       render();
+      applyServerData(item, await postStep(urlFor("extract", item.serverId)));
     }
 
-    state.uploading = false;
-    render();
-    if (sent) {
-      toast(
-        sent === 1
-          ? "Vídeo enviado. Ele será transcrito assim que chegar a vez dele na fila."
-          : `${sent} vídeos enviados. Eles serão transcritos um de cada vez.`,
-        "success",
-      );
+    while (item.status === "TRANSCRIBING" && generation === state.generation) {
+      render();
+      applyServerData(item, await postStep(urlFor("transcribe", item.serverId)));
     }
-    if (failed) {
-      toast(
-        failed === 1
-          ? "1 vídeo não pôde ser enviado. Veja o motivo no card."
-          : `${failed} vídeos não puderam ser enviados. Veja o motivo nos cards.`,
-        "error",
-      );
-    }
-    refresh();
   }
 
-  // ----------------------------------------------------------------- polling
-
-  function needsPolling() {
-    return state.uploading || state.items.some((i) => i.serverId && SERVER_ACTIVE.has(i.status));
-  }
-
-  function schedulePoll() {
-    clearTimeout(state.pollTimer);
-    state.pollTimer = null;
-    if (!needsPolling()) return;
-    state.pollTimer = setTimeout(refresh, document.hidden ? POLL_HIDDEN_MS : POLL_MS);
-  }
-
-  async function refresh() {
-    if (state.fetching) return;
-    state.fetching = true;
-    clearTimeout(state.pollTimer);
-    state.pollTimer = null;
+  async function runQueue() {
+    if (state.running || !nextWorkItem()) return;
     const generation = state.generation;
-    const requestStartedAt = performance.now();
-    try {
-      const response = await fetch(config.urls.status, { headers: { Accept: "application/json" }, cache: "no-store" });
-      const data = await readJson(response);
-      if (!response.ok || !data) throw new Error();
-      if (generation === state.generation) mergeStatus(data, { notify: true, requestStartedAt });
-      if (state.connectionLost) {
-        state.connectionLost = false;
-        toast("Conexão restabelecida.", "success");
+    state.running = true;
+    state.attempted = new Set();
+    render();
+
+    let processed = 0;
+    let stopped = false;
+    while (generation === state.generation) {
+      const item = nextWorkItem();
+      if (!item) break;
+      state.attempted.add(item);
+      state.current = item;
+      render();
+      try {
+        await processItem(item, generation);
+      } catch (err) {
+        if (generation !== state.generation) break;
+        if (err instanceof VideoRemovedError) {
+          removeItem(item);
+          continue;
+        }
+        stopped = true;
+        toast(friendlyMessage(err, "O processamento foi interrompido."), "error");
+        break;
       }
-    } catch {
-      if (!state.connectionLost) {
-        state.connectionLost = true;
-        toast("Não foi possível atualizar o status. Tentando novamente...", "error");
-      }
-    } finally {
-      state.fetching = false;
-      schedulePoll();
+      if (generation !== state.generation) break;
+      processed++;
+      if (item.status === "COMPLETED") toast(`Transcrição concluída: ${item.name}`, "success");
+      if (item.status === "ERROR") toast(`Não foi possível processar “${item.name}”.`, "error");
+      if (item.status === "UPLOAD_ERROR") toast(`Não foi possível enviar “${item.name}”.`, "error");
     }
+
+    const sameGeneration = generation === state.generation;
+    state.running = false;
+    state.current = null;
+    render();
+    if (sameGeneration && !stopped && processed > 0) announceFinished();
+  }
+
+  function announceFinished() {
+    const errors = state.items.filter((i) => i.status === "ERROR" || i.status === "UPLOAD_ERROR").length;
+    const done = state.items.filter((i) => i.status === "COMPLETED").length;
+    if (!errors) toast("Todos os vídeos foram transcritos", "success");
+    else toast(`Processamento finalizado: ${done} concluído(s), ${errors} com erro.`, "error");
   }
 
   // ------------------------------------------------------------------ limpar
@@ -497,10 +450,11 @@
   }
 
   async function clearAll() {
-    if (!state.items.length || state.uploading || state.clearing) return;
+    if (!state.items.length || state.clearing) return;
     if (!(await confirmClear())) return;
 
     state.clearing = true;
+    state.generation++; // interrompe o processamento em andamento
     render();
     try {
       const response = await fetch(config.urls.clear, {
@@ -514,17 +468,14 @@
           : "Não foi possível limpar os vídeos. Tente novamente.";
         throw new Error((data && data.error) || fallback);
       }
-      state.generation++;
       previewQueue.length = 0;
       for (const item of [...state.items]) removeItem(item);
-      state.hadActiveWork = false;
       toast("Todos os vídeos foram removidos", "success");
     } catch (err) {
       toast(friendlyMessage(err, "Sem conexão com o servidor. Tente novamente."), "error");
     } finally {
       state.clearing = false;
       render();
-      schedulePoll();
     }
   }
 
@@ -552,11 +503,7 @@
   }
 
   async function handleCopy(item) {
-    if (item.transcription === null) await loadTranscription(item);
-    if (!item.transcription) {
-      toast("A transcrição ainda não está disponível. Tente novamente.", "error");
-      return;
-    }
+    if (!item.transcription) return;
     try {
       await copyText(item.transcription);
     } catch {
@@ -617,25 +564,41 @@
     if (el.textContent !== text) el.textContent = text;
   }
 
-  function detailFor(item) {
-    switch (item.status) {
+  /** Status exibido: considera se o vídeo está na fila, em andamento ou pausado. */
+  function displayStatus(item) {
+    if (item === state.current || !WORKABLE.has(item.status)) return item.status;
+    if (state.running && !state.attempted.has(item)) return "QUEUED";
+    if (SERVER_UNFINISHED.has(item.status)) return "PAUSED";
+    return item.status;
+  }
+
+  function queuePosition(item) {
+    const queue = state.items.filter((i) => i === state.current || (WORKABLE.has(i.status) && !state.attempted.has(i)));
+    return Math.max(0, queue.indexOf(item));
+  }
+
+  function detailFor(item, status) {
+    switch (status) {
       case "LOCAL":
-        return `${formatBytes(item.size)} · clique em “Transcrever vídeos” para enviar`;
+        return `${formatBytes(item.size)} · clique em “Transcrever vídeos” para começar`;
+      case "QUEUED": {
+        const ahead = queuePosition(item);
+        return ahead === 1 ? "Próximo da fila." : `Na fila: ${plural(ahead, "vídeo", "vídeos")} antes deste.`;
+      }
+      case "PAUSED":
+        return item.progress > 0
+          ? `Interrompido em ${item.progress}%. Clique em “Transcrever vídeos” para continuar.`
+          : "Interrompido. Clique em “Transcrever vídeos” para continuar.";
       case "UPLOADING":
         return item.progress >= 100
           ? "Finalizando o envio e gerando a miniatura..."
           : `${formatBytes(item.uploadedBytes)} de ${formatBytes(item.size)}`;
       case "UPLOAD_ERROR":
         return "Clique em “Transcrever vídeos” para tentar novamente.";
-      case "PENDING":
-        if (!state.workerOnline) return "Na fila, aguardando o processador ser iniciado.";
-        if (item.queuePosition === null || item.queuePosition === undefined) return "Na fila de processamento.";
-        if (item.queuePosition === 0) return "Próximo da fila: o processamento começa em instantes.";
-        return `Na fila: ${plural(item.queuePosition, "vídeo", "vídeos")} antes deste.`;
       case "EXTRACTING_AUDIO":
         return "Separando o áudio do vídeo. Em seguida vem a transcrição.";
       case "TRANSCRIBING":
-        return "Convertendo a fala em texto. O resultado aparecerá aqui.";
+        return "Convertendo a fala em texto. O texto vai aparecendo abaixo.";
       default:
         return "";
     }
@@ -644,11 +607,12 @@
   function renderItem(item, position) {
     if (!item.el) item.el = buildCard(item);
     const el = item.el;
-    const meta = STATUS[item.status] || STATUS.ERROR;
+    const status = displayStatus(item);
+    const meta = STATUS[status] || STATUS.ERROR;
 
-    el.root.classList.toggle("is-active", item.status === "UPLOADING" || IN_PROGRESS.has(item.status));
-    el.root.classList.toggle("is-success", item.status === "COMPLETED");
-    el.root.classList.toggle("is-error", item.status === "ERROR" || item.status === "UPLOAD_ERROR");
+    el.root.classList.toggle("is-active", item === state.current);
+    el.root.classList.toggle("is-success", status === "COMPLETED");
+    el.root.classList.toggle("is-error", status === "ERROR" || status === "UPLOAD_ERROR");
     if (position) setText(el.index, `#${position}`);
 
     setText(el.name, item.name);
@@ -672,82 +636,72 @@
       el.statusIcon.dataset.icon = meta.icon;
     }
     setText(el.statusLabel, meta.label);
-    const showPercent = item.status === "UPLOADING" || (item.status === "TRANSCRIBING" && item.progress > 0);
-    setText(el.statusPercent, showPercent ? `${item.progress}%` : "");
-    setText(el.detail, detailFor(item));
+    // Percentual só quando há métrica real: bytes enviados ou áudio já transcrito.
+    const determinate = (status === "UPLOADING" || status === "TRANSCRIBING") && item.progress !== null;
+    setText(el.statusPercent, determinate ? `${item.progress}%` : "");
+    setText(el.detail, detailFor(item, status));
 
-    // Barra de progresso: percentual só quando existe métrica real.
-    const determinate = showPercent;
-    const indeterminate = item.status === "EXTRACTING_AUDIO" || (item.status === "TRANSCRIBING" && !(item.progress > 0));
+    const indeterminate = status === "EXTRACTING_AUDIO";
     el.progress.hidden = !(determinate || indeterminate);
     el.progress.classList.toggle("is-indeterminate", indeterminate);
     el.progressFill.style.width = determinate ? `${item.progress}%` : "";
 
     // Erro
-    const hasError = item.status === "ERROR" || item.status === "UPLOAD_ERROR";
+    const hasError = status === "ERROR" || status === "UPLOAD_ERROR";
     el.error.hidden = !hasError;
     if (hasError) setText(el.error, item.error || "Não foi possível processar o vídeo.");
 
-    // Transcrição
-    const completed = item.status === "COMPLETED";
-    el.transcript.hidden = !completed;
-    if (completed) {
-      let text;
-      let empty = true;
-      if (!item.hasTranscription) text = "Nenhuma fala foi detectada neste vídeo.";
-      else if (item.transcription !== null) {
-        text = item.transcription;
-        empty = false;
-      } else if (item.transcriptionFailed && !item.loadingTranscription) {
-        text = "Não foi possível carregar a transcrição. Clique em copiar para tentar novamente.";
-      } else text = "Carregando transcrição...";
-      setText(el.transcriptText, text);
+    // Transcrição: aparece enquanto é gerada; o botão de copiar só no final.
+    const completed = status === "COMPLETED";
+    const showText = completed || (item.transcription && SERVER_UNFINISHED.has(item.status));
+    el.transcript.hidden = !showText;
+    if (showText) {
+      const empty = !item.transcription;
+      const text = empty ? "Nenhuma fala foi reconhecida neste vídeo." : item.transcription;
+      if (el.transcriptText.textContent !== text) {
+        const atBottom = el.transcriptText.scrollHeight - el.transcriptText.scrollTop - el.transcriptText.clientHeight < 8;
+        el.transcriptText.textContent = text;
+        if (!completed && atBottom) el.transcriptText.scrollTop = el.transcriptText.scrollHeight;
+      }
       el.transcriptText.classList.toggle("is-empty", empty);
-      el.copyButton.hidden = !item.hasTranscription;
-      el.copyButton.disabled = item.loadingTranscription;
+      el.copyButton.hidden = !completed || empty;
     }
   }
 
   function renderSummary() {
     const items = state.items;
-    const serverItems = items.filter((i) => i.serverId);
-    const hasActive = serverItems.some((i) => SERVER_ACTIVE.has(i.status));
-    els.workerAlert.hidden = state.workerOnline || !hasActive;
-
     if (!items.length) {
       els.summary.hidden = true;
       return;
     }
 
-    const localItems = items.filter((i) => !i.serverId && SENDABLE.has(i.status));
-    const current = serverItems.find((i) => IN_PROGRESS.has(i.status));
-    const pending = serverItems.filter((i) => i.status === "PENDING");
-    const done = serverItems.filter((i) => i.status === "COMPLETED").length;
-    const errors = serverItems.filter((i) => i.status === "ERROR").length;
+    const workable = items.filter((i) => WORKABLE.has(i.status));
+    const paused = workable.filter((i) => SERVER_UNFINISHED.has(i.status)).length;
+    const done = items.filter((i) => i.status === "COMPLETED").length;
+    const errors = items.filter((i) => i.status === "ERROR" || i.status === "UPLOAD_ERROR").length;
 
     let tone = "active";
     let icon = ICONS.spinner;
     let title;
     let detail;
 
-    if (state.uploading) {
-      title = `Enviando vídeo ${state.uploadIndex} de ${state.uploadTotal}...`;
-      detail = "Mantenha esta página aberta até o envio terminar. A transcrição começa automaticamente.";
-    } else if (current) {
-      const position = serverItems.indexOf(current) + 1;
-      title = `Processando vídeo ${position} de ${serverItems.length}`;
-      const stage = current.status === "EXTRACTING_AUDIO" ? "Extraindo áudio de" : "Transcrevendo";
-      detail = `${stage} “${current.name}”. Os demais serão processados automaticamente, um por vez.`;
-    } else if (pending.length) {
+    if (state.running && state.current) {
+      const current = state.current;
+      title = `Processando vídeo ${items.indexOf(current) + 1} de ${items.length}`;
+      const name = `“${current.name}”`;
+      const stage = {
+        UPLOADING: `Enviando ${name} (${current.progress || 0}%).`,
+        EXTRACTING_AUDIO: `Extraindo o áudio de ${name}.`,
+        TRANSCRIBING: `Transcrevendo ${name} (${current.progress || 0}%).`,
+      }[current.status] || `Processando ${name}.`;
+      detail = `${stage} Mantenha esta página aberta até terminar.`;
+    } else if (workable.length) {
       tone = "idle";
-      icon = ICONS.clock;
-      title = state.workerOnline ? "Seus vídeos estão na fila" : "Vídeos aguardando o processador";
-      detail = `${plural(pending.length, "vídeo aguardando", "vídeos aguardando")}. O processamento começa automaticamente.`;
-    } else if (localItems.length) {
-      tone = "idle";
-      icon = ICONS.film;
-      title = `${plural(localItems.length, "vídeo pronto", "vídeos prontos")} para envio`;
-      detail = "Clique em “Transcrever vídeos” para começar.";
+      icon = paused ? ICONS.pause : ICONS.film;
+      title = `${plural(workable.length, "vídeo aguardando", "vídeos aguardando")} transcrição`;
+      detail = paused
+        ? "Clique em “Transcrever vídeos”: os interrompidos continuam de onde pararam."
+        : "Clique em “Transcrever vídeos” para começar.";
     } else if (!errors) {
       tone = "success";
       icon = ICONS.check;
@@ -771,17 +725,11 @@
   }
 
   function renderControls() {
-    const hasSendable = state.items.some((i) => !i.serverId && SENDABLE.has(i.status));
-    const processing = state.items.some((i) => i.serverId && SERVER_ACTIVE.has(i.status));
-    const busy = state.uploading || (!hasSendable && processing);
-
-    els.transcribeButton.disabled = state.uploading || state.clearing || !hasSendable;
-    els.transcribeButton.classList.toggle("is-busy", busy);
-    setText(
-      els.transcribeLabel,
-      state.uploading ? "Enviando vídeos..." : busy ? "Transcrevendo..." : "Transcrever vídeos",
-    );
-    els.clearButton.disabled = !state.items.length || state.uploading || state.clearing;
+    const hasWork = state.items.some((i) => WORKABLE.has(i.status));
+    els.transcribeButton.disabled = state.running || state.clearing || !hasWork;
+    els.transcribeButton.classList.toggle("is-busy", state.running);
+    setText(els.transcribeLabel, state.running ? "Transcrevendo..." : "Transcrever vídeos");
+    els.clearButton.disabled = !state.items.length || state.clearing;
     els.pickButton.disabled = state.clearing;
   }
 
@@ -799,17 +747,13 @@
     addFiles(Array.from(els.fileInput.files || []));
     els.fileInput.value = ""; // permite selecionar o mesmo arquivo de novo
   });
-  els.transcribeButton.addEventListener("click", startTranscription);
+  els.transcribeButton.addEventListener("click", runQueue);
   els.clearButton.addEventListener("click", clearAll);
-
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && needsPolling()) refresh();
-  });
   window.addEventListener("beforeunload", (event) => {
-    if (state.uploading) event.preventDefault();
+    if (state.running) event.preventDefault();
   });
 
-  // Estado inicial vindo do servidor (evita "piscar" a tela vazia ao recarregar).
-  mergeStatus(config.initialStatus, { notify: false, requestStartedAt: 0 });
-  schedulePoll();
+  // Estado inicial vindo do servidor.
+  for (const video of config.videos) applyServerData(createItem({}), video);
+  render();
 })();

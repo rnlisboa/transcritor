@@ -18,17 +18,17 @@ class Video(models.Model):
         COMPLETED = "COMPLETED", "Transcrição concluída"
         ERROR = "ERROR", "Erro no processamento"
 
-    IN_PROGRESS_STATUSES = (Status.EXTRACTING_AUDIO, Status.TRANSCRIBING)
-    ACTIVE_STATUSES = (Status.PENDING, *IN_PROGRESS_STATUSES)
-
     # Identifica a sessão do navegador dona do vídeo (a aplicação não tem login).
     owner_key = models.CharField(max_length=64, db_index=True)
     original_name = models.CharField(max_length=255)
-    video_file = models.FileField(upload_to=video_upload_to, max_length=255)
+    # O vídeo é apagado assim que o áudio é extraído (economiza disco).
+    video_file = models.FileField(upload_to=video_upload_to, blank=True, max_length=255)
     audio_file = models.FileField(blank=True, max_length=255)
     thumbnail = models.FileField(blank=True, max_length=255)
     transcription = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True)
+    # Até onde o áudio já foi transcrito (em amostras). Permite retomar de onde parou.
+    audio_position = models.PositiveIntegerField(default=0)
     # Percentual real (0–100) quando disponível; nulo quando não há métrica confiável.
     progress = models.PositiveSmallIntegerField(null=True, blank=True)
     error_message = models.CharField(max_length=500, blank=True)

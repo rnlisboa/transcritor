@@ -111,17 +111,12 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 
 # --- Banco de dados ------------------------------------------------------------
-# SQLite com timeout maior: o worker e a aplicação web escrevem no mesmo arquivo.
-# "IMMEDIATE" evita erros de "database is locked" ao promover leituras a escritas.
 
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
-        "OPTIONS": {
-            "timeout": 30,
-            "transaction_mode": "IMMEDIATE",
-        },
+        "OPTIONS": {"timeout": 30},
     }
 }
 
@@ -159,7 +154,7 @@ X_FRAME_OPTIONS = "DENY"
 
 # --- Upload -------------------------------------------------------------------------
 
-MAX_UPLOAD_SIZE_MB = env_int("MAX_UPLOAD_SIZE_MB", 500)
+MAX_UPLOAD_SIZE_MB = env_int("MAX_UPLOAD_SIZE_MB", 200)
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 ALLOWED_VIDEO_EXTENSIONS = [".mp4", ".webm", ".mov", ".mkv", ".avi"]
 # Arquivos acima de 5 MB vão para um arquivo temporário em disco, não para a memória.
@@ -169,21 +164,17 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024
 
 FFMPEG_BINARY = env_str("FFMPEG_BINARY") or "ffmpeg"
 
-# --- Faster-Whisper -------------------------------------------------------------------
+# --- Vosk (transcrição) ---------------------------------------------------------------
+# Pasta do modelo descompactado. Baixe com: python manage.py download_vosk_model
 
-WHISPER_MODEL = env_str("WHISPER_MODEL") or "base"
-WHISPER_DEVICE = env_str("WHISPER_DEVICE") or "cpu"
-WHISPER_COMPUTE_TYPE = env_str("WHISPER_COMPUTE_TYPE") or "int8"
-WHISPER_LANGUAGE = env_str("WHISPER_LANGUAGE") or "pt"
-
-# --- Worker ---------------------------------------------------------------------------
-
-WORKER_POLL_INTERVAL = max(1, env_int("WORKER_POLL_INTERVAL", 5))
-WORKER_STATE_DIR = BASE_DIR / "var"
+VOSK_MODEL_PATH = Path(env_str("VOSK_MODEL_PATH") or BASE_DIR / "models" / "vosk-model-small-pt-0.3")
+# Cada requisição de transcrição processa áudio por ~N segundos e para na próxima
+# pausa da fala. Mantém as requisições curtas (o PythonAnywhere corta em 5 minutos).
+TRANSCRIBE_CHUNK_SECONDS = max(2, env_int("TRANSCRIBE_CHUNK_SECONDS", 10))
 
 # --- Logs -----------------------------------------------------------------------------
 # Tudo vai para o console (stdout/stderr). No PythonAnywhere isso aparece no
-# "error log" da aplicação web e no log da Always-on Task do worker.
+# "error log" da aplicação web.
 
 LOG_LEVEL = env_str("LOG_LEVEL") or "INFO"
 

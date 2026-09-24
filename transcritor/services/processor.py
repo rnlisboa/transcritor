@@ -1,12 +1,16 @@
-"""Processamento de um vídeo: extração de áudio -> transcrição -> conclusão.
+"""Etapas do processamento de um vídeo, cada uma executada numa requisição curta.
 
-Todas as alterações de status usam QuerySet.update() (nunca Model.save()):
-assim, se o vídeo for removido durante o processamento, a atualização afeta
-0 linhas e o processamento é abortado, em vez de recriar o registro apagado.
+O navegador conduz o fluxo, um vídeo por vez:
+
+    upload (PENDING) → extract_audio (EXTRACTING_AUDIO → TRANSCRIBING)
+                     → transcribe_next_chunk, repetido até COMPLETED
+
+Como o estado fica no banco, o processamento pode ser retomado depois se a
+página for fechada. As atualizações usam UPDATE condicional (QuerySet.update),
+nunca Model.save(): um vídeo removido durante uma etapa não é recriado.
 """
 import errno
 import logging
-import time
 from pathlib import Path
 
 from django.conf import settings
@@ -15,21 +19,13 @@ from django.core.files.storage import default_storage
 from django.utils import timezone
 
 from ..models import Video
-from . import ffmpeg
-from .errors import ProcessingError, VideoDeletedError, WorkerStopRequested
+from . import ffmpeg, transcription
+from .errors import InvalidStateError, ProcessingError
 
 logger = logging.getLogger(__name__)
 
 GENERIC_ERROR_MESSAGE = "Ocorreu um erro inesperado ao processar o vídeo."
 DISK_FULL_MESSAGE = "Não há espaço em disco suficiente no servidor para processar o vídeo."
-PROGRESS_SAVE_INTERVAL_SECONDS = 3
-
-
-def _update(video_id, **fields):
-    """Atualiza o vídeo; levanta VideoDeletedError se ele não existir mais."""
-    fields["updated_at"] = timezone.now()
-    if not Video.objects.filter(pk=video_id).update(**fields):
-        raise VideoDeletedError()
 
 
 def delete_stored_files(names):
@@ -44,60 +40,99 @@ def delete_stored_files(names):
 
 
 def audio_name_for(video):
-    return f"audio/{Path(video.video_file.name).stem}.wav"
+    return f"audio/{video.pk}.wav"
 
 
-def claim_next_video():
-    """Reserva o vídeo pendente mais antigo de forma atômica.
-
-    A troca PENDING -> EXTRACTING_AUDIO é um UPDATE condicional
-    (WHERE status = 'PENDING'): se dois workers tentarem pegar o mesmo vídeo,
-    apenas um deles consegue atualizar a linha.
-    """
-    while True:
-        candidate_id = (
-            Video.objects.filter(status=Video.Status.PENDING)
-            .order_by("created_at", "id")
-            .values_list("id", flat=True)
-            .first()
-        )
-        if candidate_id is None:
-            return None
-        claimed = Video.objects.filter(pk=candidate_id, status=Video.Status.PENDING).update(
-            status=Video.Status.EXTRACTING_AUDIO,
-            progress=None,
-            error_message="",
-            updated_at=timezone.now(),
-        )
-        if claimed:
-            try:
-                return Video.objects.get(pk=candidate_id)
-            except Video.DoesNotExist:
-                continue  # removido logo após a reserva
+def _friendly_message(exc):
+    if isinstance(exc, ProcessingError):
+        return exc.user_message
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return DISK_FULL_MESSAGE
+    return GENERIC_ERROR_MESSAGE
 
 
-def requeue_interrupted_videos():
-    """Devolve para a fila vídeos que ficaram "em andamento" após uma queda do worker.
-
-    Só deve ser chamada por um worker que detém o lock de instância única.
-    """
-    interrupted = list(Video.objects.filter(status__in=Video.IN_PROGRESS_STATUSES))
-    for video in interrupted:
-        delete_stored_files([video.audio_file.name])
-    count = Video.objects.filter(pk__in=[v.pk for v in interrupted]).update(
-        status=Video.Status.PENDING, progress=None, audio_file="", updated_at=timezone.now()
+def _fail(video, exc):
+    """Marca o vídeo como ERROR e apaga vídeo e áudio (não há como reprocessar)."""
+    message = _friendly_message(exc)
+    if isinstance(exc, ProcessingError):
+        logger.warning("Vídeo #%s: %s", video.pk, message)
+    else:
+        logger.error("Vídeo #%s: erro inesperado.", video.pk, exc_info=exc)
+    Video.objects.filter(pk=video.pk).update(
+        status=Video.Status.ERROR, error_message=message[:500], progress=None,
+        video_file="", audio_file="", updated_at=timezone.now(),
     )
-    if count:
-        logger.warning("%s vídeo(s) interrompido(s) voltaram para a fila.", count)
-    return count
+    delete_stored_files([video.video_file.name, video.audio_file.name, audio_name_for(video)])
+
+
+def extract_audio(video):
+    """Extrai o áudio (WAV mono 16 kHz) e apaga o vídeo, que não é mais necessário.
+
+    É rápido mesmo para vídeos longos: o FFmpeg só decodifica a trilha de áudio.
+    """
+    claimed = Video.objects.filter(
+        pk=video.pk, status__in=(Video.Status.PENDING, Video.Status.EXTRACTING_AUDIO)
+    ).update(status=Video.Status.EXTRACTING_AUDIO, progress=None, error_message="", updated_at=timezone.now())
+    if not claimed:
+        raise InvalidStateError()
+
+    audio_name = audio_name_for(video)
+    try:
+        if not video.video_file:
+            raise ProcessingError("O arquivo do vídeo não foi encontrado. Envie o vídeo novamente.")
+        Video.objects.filter(pk=video.pk).update(audio_file=audio_name)
+        ffmpeg.extract_audio(Path(video.video_file.path), Path(settings.MEDIA_ROOT) / audio_name)
+    except Exception as exc:
+        _fail(video, exc)
+        return
+
+    Video.objects.filter(pk=video.pk).update(
+        status=Video.Status.TRANSCRIBING, progress=0, audio_position=0, transcription="",
+        video_file="", updated_at=timezone.now(),
+    )
+    delete_stored_files([video.video_file.name])
+    logger.info("Vídeo #%s: áudio extraído; vídeo original removido.", video.pk)
+
+
+def transcribe_next_chunk(video):
+    """Transcreve o próximo pedaço do áudio e salva o avanço."""
+    if video.status != Video.Status.TRANSCRIBING:
+        raise InvalidStateError()
+
+    audio_path = Path(video.audio_file.path) if video.audio_file else None
+    try:
+        if audio_path is None or not audio_path.is_file():
+            raise ProcessingError("O áudio extraído não foi encontrado. Envie o vídeo novamente.")
+        result = transcription.transcribe_chunk(audio_path, video.audio_position)
+    except Exception as exc:
+        _fail(video, exc)
+        return
+
+    text = " ".join(part for part in (video.transcription, result.text) if part)
+    text = text[:1].upper() + text[1:]  # o Vosk devolve tudo em minúsculas
+    fields = {
+        "transcription": text,
+        "audio_position": result.position,
+        "progress": min(99, result.position * 100 // max(result.total, 1)),
+        "updated_at": timezone.now(),
+    }
+    if result.finished:
+        fields.update(status=Video.Status.COMPLETED, progress=100, audio_file="")
+
+    # Só salva se ninguém avançou este vídeo no meio tempo (ex.: duas abas abertas).
+    saved = Video.objects.filter(
+        pk=video.pk, status=Video.Status.TRANSCRIBING, audio_position=video.audio_position
+    ).update(**fields)
+
+    if saved and result.finished:
+        delete_stored_files([video.audio_file.name])
+        logger.info("Vídeo #%s: transcrição concluída (%s caracteres).", video.pk, len(text))
+    elif not saved and not Video.objects.filter(pk=video.pk).exists():
+        delete_stored_files([video.audio_file.name])  # removido durante a etapa
 
 
 def clear_videos(owner_key):
-    """Remove todos os vídeos de um dono: registros primeiro, depois os arquivos.
-
-    Se o worker estiver processando um desses vídeos, ele percebe a remoção na
-    próxima atualização de status, interrompe o trabalho e apaga o que sobrou.
-    """
+    """Remove todos os vídeos de um dono: registros e arquivos."""
     videos = list(Video.objects.filter(owner_key=owner_key))
     file_names = []
     for video in videos:
@@ -107,95 +142,3 @@ def clear_videos(owner_key):
     delete_stored_files(file_names)
     logger.info("Limpeza concluída: %s vídeo(s) removido(s).", len(videos))
     return len(videos)
-
-
-class _ProgressReporter:
-    """Salva o percentual da transcrição no banco sem escrever a cada segmento."""
-
-    def __init__(self, video_id, should_stop):
-        self.video_id = video_id
-        self.should_stop = should_stop
-        self.last_saved_at = 0.0
-
-    def __call__(self, percent):
-        if self.should_stop():
-            raise WorkerStopRequested()
-        now = time.monotonic()
-        if now - self.last_saved_at >= PROGRESS_SAVE_INTERVAL_SECONDS:
-            _update(self.video_id, progress=percent)
-            self.last_saved_at = now
-
-
-def process_video(video, transcriber, should_stop=lambda: False):
-    """Processa um vídeo já reservado (status EXTRACTING_AUDIO).
-
-    Nunca levanta exceção: o resultado fica registrado no banco.
-    """
-    audio_name = audio_name_for(video)
-    audio_path = Path(settings.MEDIA_ROOT) / audio_name
-    started = time.monotonic()
-    logger.info("Vídeo #%s (%s): iniciando processamento.", video.pk, video.original_name)
-
-    try:
-        _update(video.pk, audio_file=audio_name)
-        logger.info("Vídeo #%s: extraindo áudio.", video.pk)
-        ffmpeg.extract_audio(Path(video.video_file.path), audio_path)
-        if should_stop():
-            raise WorkerStopRequested()
-
-        _update(video.pk, status=Video.Status.TRANSCRIBING, progress=0)
-        logger.info("Vídeo #%s: transcrevendo.", video.pk)
-        text = transcriber.transcribe(audio_path, on_progress=_ProgressReporter(video.pk, should_stop))
-
-        _update(
-            video.pk,
-            status=Video.Status.COMPLETED,
-            transcription=text,
-            progress=100,
-            audio_file="",
-            error_message="",
-        )
-        logger.info("Vídeo #%s: concluído em %.1fs (%s caracteres).", video.pk, time.monotonic() - started, len(text))
-    except VideoDeletedError:
-        logger.info("Vídeo #%s foi removido durante o processamento; limpando arquivos.", video.pk)
-        delete_stored_files(video.stored_file_names())
-    except WorkerStopRequested:
-        _requeue(video)
-    except ProcessingError as exc:
-        if should_stop():
-            _requeue(video)  # ex.: FFmpeg interrompido pelo mesmo Ctrl+C
-        else:
-            logger.warning("Vídeo #%s: erro no processamento: %s", video.pk, exc.user_message)
-            _mark_error(video, exc.user_message)
-    except Exception as exc:
-        if should_stop():
-            _requeue(video)
-        else:
-            logger.exception("Vídeo #%s: erro inesperado no processamento.", video.pk)
-            is_disk_full = isinstance(exc, OSError) and exc.errno == errno.ENOSPC
-            _mark_error(video, DISK_FULL_MESSAGE if is_disk_full else GENERIC_ERROR_MESSAGE)
-    finally:
-        # O áudio é temporário: nunca permanece após o processamento.
-        try:
-            audio_path.unlink(missing_ok=True)
-        except OSError:
-            logger.warning("Não foi possível remover o áudio temporário %s.", audio_path, exc_info=True)
-
-
-def _mark_error(video, message):
-    try:
-        _update(video.pk, status=Video.Status.ERROR, error_message=message[:500], progress=None, audio_file="")
-    except VideoDeletedError:
-        delete_stored_files(video.stored_file_names())
-    except Exception:
-        logger.exception("Vídeo #%s: não foi possível registrar o erro no banco.", video.pk)
-
-
-def _requeue(video):
-    logger.warning("Vídeo #%s: processamento interrompido; o vídeo voltará para a fila.", video.pk)
-    try:
-        _update(video.pk, status=Video.Status.PENDING, progress=None, audio_file="")
-    except VideoDeletedError:
-        delete_stored_files(video.stored_file_names())
-    except Exception:
-        logger.exception("Vídeo #%s: não foi possível devolver o vídeo para a fila.", video.pk)

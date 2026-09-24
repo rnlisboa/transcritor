@@ -24,8 +24,8 @@ media/audio/*
 # Estáticos coletados (collectstatic)
 staticfiles/
 
-# Arquivos de controle do worker
-var/
+# Modelos de transcrição (baixados à parte)
+models/
 
 # Logs e IDEs
 *.log

@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock, skipUnless
 
+from django.conf import settings
 from django.core.files.base import ContentFile
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, TestCase, override_settings
@@ -14,31 +15,17 @@ from .models import Video
 from .services import ffmpeg, processor
 from .services.errors import ProcessingError
 from .services.ffmpeg import FFmpegNotFoundError
-from .services.worker import _process_next, worker_is_online
+from .services.transcription import ChunkResult
 
 # Cabeçalho mínimo de um MP4 (caixa "ftyp").
 MP4_BYTES = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64
 TEMP_MEDIA = tempfile.mkdtemp(prefix="transcritor-tests-")
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+VOSK_MODEL_AVAILABLE = Path(settings.VOSK_MODEL_PATH).is_dir()
 
 
 def mp4_upload(name="aula.mp4", content=MP4_BYTES, content_type="video/mp4"):
     return SimpleUploadedFile(name, content, content_type=content_type)
-
-
-class FakeTranscriber:
-    def __init__(self, text="Olá, mundo.", error=None, on_call=None):
-        self.text, self.error, self.on_call, self.calls = text, error, on_call, 0
-
-    def transcribe(self, audio_path, on_progress=None):
-        self.calls += 1
-        if self.on_call:
-            self.on_call()
-        if on_progress:
-            on_progress(50)
-        if self.error:
-            raise self.error
-        return self.text
 
 
 def fake_extract_audio(video_path, audio_path):
@@ -47,8 +34,7 @@ def fake_extract_audio(video_path, audio_path):
     return audio_path
 
 
-@override_settings(MEDIA_ROOT=TEMP_MEDIA, WORKER_STATE_DIR=Path(TEMP_MEDIA) / "var", MAX_UPLOAD_SIZE_MB=1,
-                   MAX_UPLOAD_SIZE_BYTES=1024 * 1024)
+@override_settings(MEDIA_ROOT=TEMP_MEDIA, MAX_UPLOAD_SIZE_MB=1, MAX_UPLOAD_SIZE_BYTES=1024 * 1024)
 class BaseTestCase(TestCase):
     @classmethod
     def tearDownClass(cls):
@@ -57,7 +43,7 @@ class BaseTestCase(TestCase):
 
     def setUp(self):
         self.client = Client()
-        self.client.get(reverse("transcritor:index"))  # cria a sessão (dono dos vídeos)
+        self.client.get(reverse("transcritor:index"))  # cria a sessão (dona dos vídeos)
         self.owner_key = self.client.session["owner_key"]
 
     def create_video(self, owner_key=None, status=Video.Status.PENDING, name="video.mp4"):
@@ -65,6 +51,17 @@ class BaseTestCase(TestCase):
         video.video_file.save(name, ContentFile(MP4_BYTES), save=False)
         video.save()
         return video
+
+    def create_transcribing_video(self, **kwargs):
+        video = self.create_video(status=Video.Status.TRANSCRIBING, **kwargs)
+        audio_name = processor.audio_name_for(video)
+        fake_extract_audio(None, Path(TEMP_MEDIA) / audio_name)
+        Video.objects.filter(pk=video.pk).update(audio_file=audio_name, video_file="")
+        video.refresh_from_db()
+        return video
+
+    def post_step(self, name, video):
+        return self.client.post(reverse(f"transcritor:{name}", args=[video.pk]))
 
 
 class VideoModelTests(BaseTestCase):
@@ -91,10 +88,10 @@ class UploadTests(BaseTestCase):
         return self.client.post(reverse("transcritor:upload"), {"file": file})
 
     def test_upload_creates_pending_video_without_processing(self, _thumb):
-        with mock.patch("transcritor.services.processor.process_video") as process:
+        with mock.patch("transcritor.services.processor.extract_audio") as extract:
             response = self.upload(mp4_upload())
         self.assertEqual(response.status_code, 201)
-        process.assert_not_called()  # a transcrição nunca acontece na requisição
+        extract.assert_not_called()  # o upload só salva; as etapas vêm depois
         data = response.json()["video"]
         self.assertEqual(data["status"], "PENDING")
         self.assertEqual(data["name"], "aula.mp4")
@@ -139,33 +136,101 @@ class UploadTests(BaseTestCase):
         self.assertEqual(self.client.get(reverse("transcritor:upload")).status_code, 405)
 
 
-class StatusEndpointTests(BaseTestCase):
-    def test_returns_only_own_videos_with_queue_position(self):
-        self.create_video(owner_key="outra-pessoa", status=Video.Status.TRANSCRIBING)
-        mine = self.create_video()
-        data = self.client.get(reverse("transcritor:status")).json()
-        self.assertEqual([v["id"] for v in data["videos"]], [mine.pk])
-        self.assertEqual(data["videos"][0]["status"], "PENDING")
-        self.assertEqual(data["videos"][0]["queue_position"], 1)  # um vídeo sendo processado à frente
-        self.assertIn("worker_online", data)
-
-    def test_transcription_endpoint(self):
-        video = self.create_video(status=Video.Status.COMPLETED)
-        Video.objects.filter(pk=video.pk).update(transcription="Texto final.")
-        status = self.client.get(reverse("transcritor:status")).json()["videos"][0]
-        self.assertTrue(status["has_transcription"])
-        data = self.client.get(reverse("transcritor:transcription", args=[video.pk])).json()
-        self.assertEqual(data["transcription"], "Texto final.")
-
-    def test_cannot_read_other_owner_transcription(self):
-        video = self.create_video(owner_key="outra-pessoa", status=Video.Status.COMPLETED)
-        response = self.client.get(reverse("transcritor:transcription", args=[video.pk]))
-        self.assertEqual(response.status_code, 404)
-
-    def test_index_renders_title(self):
+class PageTests(BaseTestCase):
+    def test_index_renders_title_and_only_own_videos(self):
+        self.create_video(name="meu.mp4")
+        self.create_video(owner_key="outra-pessoa", name="alheio.mp4")
         response = self.client.get(reverse("transcritor:index"))
         self.assertContains(response, "Transcritor da Gabi")
-        self.assertContains(response, "Escolher vídeos para transcrição")
+        self.assertContains(response, "meu.mp4")
+        self.assertNotContains(response, "alheio.mp4")
+
+
+@mock.patch("transcritor.services.processor.ffmpeg.extract_audio", side_effect=fake_extract_audio)
+class ExtractStepTests(BaseTestCase):
+    def test_extract_moves_to_transcribing_and_deletes_video(self, _extract):
+        video = self.create_video()
+        response = self.post_step("extract", video)
+        self.assertEqual(response.json()["video"]["status"], "TRANSCRIBING")
+        video_path = Path(video.video_file.path)
+        video.refresh_from_db()
+        self.assertEqual(video.video_file.name, "")
+        self.assertFalse(video_path.exists())  # o vídeo é apagado para economizar disco
+        self.assertTrue(Path(video.audio_file.path).is_file())
+
+    def test_ffmpeg_error_marks_video_as_error_with_friendly_message(self, extract):
+        extract.side_effect = ProcessingError("O vídeo não possui trilha de áudio para transcrever.")
+        video = self.create_video()
+        data = self.post_step("extract", video).json()["video"]
+        self.assertEqual(data["status"], "ERROR")
+        self.assertEqual(data["error"], "O vídeo não possui trilha de áudio para transcrever.")
+        self.assertFalse(Path(video.video_file.path).exists())
+
+    def test_unexpected_error_does_not_leak_details(self, extract):
+        extract.side_effect = RuntimeError("segredo interno")
+        data = self.post_step("extract", self.create_video()).json()["video"]
+        self.assertEqual(data["status"], "ERROR")
+        self.assertNotIn("segredo", data["error"])
+
+    def test_extract_on_completed_video_returns_conflict(self, _extract):
+        video = self.create_video(status=Video.Status.COMPLETED)
+        response = self.post_step("extract", video)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["video"]["status"], "COMPLETED")
+
+    def test_cannot_process_other_owner_video(self, _extract):
+        video = self.create_video(owner_key="outra-pessoa")
+        self.assertEqual(self.post_step("extract", video).status_code, 404)
+
+    def test_steps_require_post(self, _extract):
+        video = self.create_video()
+        self.assertEqual(self.client.get(reverse("transcritor:extract", args=[video.pk])).status_code, 405)
+
+
+class TranscribeStepTests(BaseTestCase):
+    def test_chunks_accumulate_text_and_finish(self):
+        video = self.create_transcribing_video()
+        chunks = [ChunkResult("olá gabi", 50, 100), ChunkResult("tudo bem", 100, 100)]
+        with mock.patch("transcritor.services.processor.transcription.transcribe_chunk", side_effect=chunks) as chunk:
+            first = self.post_step("transcribe", video).json()["video"]
+            second = self.post_step("transcribe", video).json()["video"]
+
+        self.assertEqual((first["status"], first["progress"]), ("TRANSCRIBING", 50))
+        self.assertEqual(first["transcription"], "Olá gabi")
+        self.assertEqual(chunk.call_args_list[1].args[1], 50)  # retoma de onde parou
+        self.assertEqual((second["status"], second["progress"]), ("COMPLETED", 100))
+        self.assertEqual(second["transcription"], "Olá gabi tudo bem")
+        self.assertFalse(any((Path(TEMP_MEDIA) / "audio").glob(f"{video.pk}.wav")))  # áudio removido
+
+    def test_transcription_error_marks_error(self):
+        video = self.create_transcribing_video()
+        with mock.patch(
+            "transcritor.services.processor.transcription.transcribe_chunk",
+            side_effect=ProcessingError("O modelo de transcrição não está disponível no servidor."),
+        ):
+            data = self.post_step("transcribe", video).json()["video"]
+        self.assertEqual(data["status"], "ERROR")
+        self.assertIn("modelo", data["error"])
+
+    def test_missing_audio_marks_error(self):
+        video = self.create_transcribing_video()
+        Path(video.audio_file.path).unlink()
+        data = self.post_step("transcribe", video).json()["video"]
+        self.assertEqual(data["status"], "ERROR")
+
+    def test_concurrent_progress_is_not_overwritten(self):
+        video = self.create_transcribing_video()
+
+        def advanced_elsewhere(*args):
+            Video.objects.filter(pk=video.pk).update(audio_position=80, transcription="outra aba")
+            return ChunkResult("duplicado", 50, 100)
+
+        with mock.patch("transcritor.services.processor.transcription.transcribe_chunk", side_effect=advanced_elsewhere):
+            data = self.post_step("transcribe", video).json()["video"]
+        self.assertEqual(data["transcription"], "outra aba")
+
+    def test_transcribe_on_pending_video_returns_conflict(self):
+        self.assertEqual(self.post_step("transcribe", self.create_video()).status_code, 409)
 
 
 class ClearTests(BaseTestCase):
@@ -175,14 +240,17 @@ class ClearTests(BaseTestCase):
         thumb.parent.mkdir(parents=True, exist_ok=True)
         thumb.write_bytes(b"jpg")
         Video.objects.filter(pk=mine.pk).update(thumbnail="thumbnails/t.jpg")
+        transcribing = self.create_transcribing_video()
+        audio = Path(transcribing.audio_file.path)
         other = self.create_video(owner_key="outra-pessoa")
 
         response = self.client.post(reverse("transcritor:clear"))
 
-        self.assertEqual(response.json()["removed"], 1)
-        self.assertFalse(Video.objects.filter(pk=mine.pk).exists())
+        self.assertEqual(response.json()["removed"], 2)
+        self.assertFalse(Video.objects.filter(owner_key=self.owner_key).exists())
         self.assertFalse(Path(mine.video_file.path).exists())
         self.assertFalse(thumb.exists())
+        self.assertFalse(audio.exists())
         self.assertTrue(Video.objects.filter(pk=other.pk).exists())
         self.assertTrue(Path(other.video_file.path).exists())
 
@@ -192,81 +260,6 @@ class ClearTests(BaseTestCase):
         response = self.client.post(reverse("transcritor:clear"))
         self.assertEqual(response.status_code, 200)
         self.assertFalse(Video.objects.exists())
-
-
-@mock.patch("transcritor.services.processor.ffmpeg.extract_audio", side_effect=fake_extract_audio)
-class ProcessorTests(BaseTestCase):
-    def test_claim_is_atomic_and_in_order(self, _extract):
-        first, second = self.create_video(), self.create_video()
-        claimed = processor.claim_next_video()
-        self.assertEqual(claimed.pk, first.pk)
-        self.assertEqual(claimed.status, Video.Status.EXTRACTING_AUDIO)
-        self.assertEqual(processor.claim_next_video().pk, second.pk)
-        self.assertIsNone(processor.claim_next_video())
-
-    def test_successful_processing(self, _extract):
-        video = self.create_video()
-        processor.process_video(processor.claim_next_video(), FakeTranscriber("Bom dia."))
-        video.refresh_from_db()
-        self.assertEqual(video.status, Video.Status.COMPLETED)
-        self.assertEqual(video.transcription, "Bom dia.")
-        self.assertEqual(video.progress, 100)
-        self.assertEqual(video.audio_file.name, "")
-        self.assertFalse(any((Path(TEMP_MEDIA) / "audio").glob("*.wav")))  # áudio temporário removido
-
-    def test_status_changes_to_transcribing_during_transcription(self, _extract):
-        video = self.create_video()
-        seen = []
-        transcriber = FakeTranscriber(on_call=lambda: seen.append(Video.objects.get(pk=video.pk).status))
-        processor.process_video(processor.claim_next_video(), transcriber)
-        self.assertEqual(seen, [Video.Status.TRANSCRIBING])
-
-    def test_ffmpeg_error_marks_video_as_error_with_friendly_message(self, extract):
-        extract.side_effect = ProcessingError("O vídeo não possui trilha de áudio para transcrever.")
-        video = self.create_video()
-        processor.process_video(processor.claim_next_video(), FakeTranscriber())
-        video.refresh_from_db()
-        self.assertEqual(video.status, Video.Status.ERROR)
-        self.assertEqual(video.error_message, "O vídeo não possui trilha de áudio para transcrever.")
-
-    def test_unexpected_error_does_not_leak_details(self, _extract):
-        video = self.create_video()
-        processor.process_video(processor.claim_next_video(), FakeTranscriber(error=RuntimeError("segredo interno")))
-        video.refresh_from_db()
-        self.assertEqual(video.status, Video.Status.ERROR)
-        self.assertNotIn("segredo", video.error_message)
-
-    def test_worker_continues_after_error(self, _extract):
-        failing, ok = self.create_video(), self.create_video()
-        transcriber = FakeTranscriber()
-        transcriber.error = RuntimeError("falha")
-        stop = mock.Mock(is_set=lambda: False)
-        self.assertTrue(_process_next(transcriber, stop))
-        transcriber.error = None
-        self.assertTrue(_process_next(transcriber, stop))
-        self.assertFalse(_process_next(transcriber, stop))
-        self.assertEqual(Video.objects.get(pk=failing.pk).status, Video.Status.ERROR)
-        self.assertEqual(Video.objects.get(pk=ok.pk).status, Video.Status.COMPLETED)
-
-    def test_video_deleted_during_processing_is_not_recreated(self, _extract):
-        video = self.create_video()
-        transcriber = FakeTranscriber(on_call=lambda: Video.objects.filter(pk=video.pk).delete())
-        processor.process_video(processor.claim_next_video(), transcriber)
-        self.assertFalse(Video.objects.filter(pk=video.pk).exists())
-        self.assertFalse(Path(video.video_file.path).exists())
-
-    def test_stop_request_requeues_video(self, _extract):
-        video = self.create_video()
-        processor.process_video(processor.claim_next_video(), FakeTranscriber(), should_stop=lambda: True)
-        self.assertEqual(Video.objects.get(pk=video.pk).status, Video.Status.PENDING)
-
-    def test_requeue_interrupted_videos(self, _extract):
-        video = self.create_video(status=Video.Status.TRANSCRIBING)
-        self.assertEqual(processor.requeue_interrupted_videos(), 1)
-        self.assertEqual(Video.objects.get(pk=video.pk).status, Video.Status.PENDING)
-
-    def test_worker_offline_without_heartbeat(self, _extract):
-        self.assertFalse(worker_is_online())
 
 
 class FFmpegServiceTests(TestCase):
@@ -294,31 +287,47 @@ class FFmpegServiceTests(TestCase):
             self.assertIn("corrompido", ctx.exception.user_message)
 
 
+def make_test_video(path, with_audio=True, seconds=2):
+    command = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi",
+               "-i", f"testsrc=duration={seconds}:size=320x240:rate=10"]
+    if with_audio:
+        command += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}", "-shortest"]
+    subprocess.run([*command, "-pix_fmt", "yuv420p", str(path)], check=True)
+
+
 @skipUnless(FFMPEG_AVAILABLE, "FFmpeg não instalado")
 class FFmpegIntegrationTests(TestCase):
-    """Usa o FFmpeg real com um vídeo sintético de 2 segundos."""
+    """Usa o FFmpeg real com vídeos sintéticos."""
 
     def test_thumbnail_and_audio_extraction(self):
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            video = tmp / "teste.mp4"
-            subprocess.run(
-                ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10",
-                 "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-shortest", "-pix_fmt", "yuv420p", str(video)],
-                check=True,
-            )
-            self.assertTrue(ffmpeg.generate_thumbnail(video, tmp / "thumb.jpg"))
-            audio = ffmpeg.extract_audio(video, tmp / "audio.wav")
+            video = Path(tmp) / "teste.mp4"
+            make_test_video(video)
+            self.assertTrue(ffmpeg.generate_thumbnail(video, Path(tmp) / "thumb.jpg"))
+            audio = ffmpeg.extract_audio(video, Path(tmp) / "audio.wav")
             self.assertGreater(audio.stat().st_size, 44)
 
     def test_video_without_audio_has_friendly_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "mudo.mp4"
-            subprocess.run(
-                ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=5",
-                 "-pix_fmt", "yuv420p", str(video)],
-                check=True,
-            )
+            make_test_video(video, with_audio=False, seconds=1)
             with self.assertRaises(ProcessingError) as ctx:
                 ffmpeg.extract_audio(video, Path(tmp) / "a.wav")
             self.assertIn("não possui trilha de áudio", ctx.exception.user_message)
+
+
+@skipUnless(FFMPEG_AVAILABLE and VOSK_MODEL_AVAILABLE, "FFmpeg ou modelo Vosk ausente")
+class FullFlowIntegrationTests(BaseTestCase):
+    """Fluxo completo com FFmpeg e Vosk reais: extrair → transcrever em pedaços → concluir."""
+
+    def test_full_flow(self):
+        video = self.create_video()
+        make_test_video(Path(video.video_file.path), seconds=3)  # substitui pelo vídeo real
+
+        self.assertEqual(self.post_step("extract", video).json()["video"]["status"], "TRANSCRIBING")
+        for _ in range(20):
+            data = self.post_step("transcribe", video).json()["video"]
+            if data["status"] != "TRANSCRIBING":
+                break
+        self.assertEqual(data["status"], "COMPLETED")
+        self.assertEqual(data["progress"], 100)
